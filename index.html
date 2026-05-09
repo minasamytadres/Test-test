@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#0D1117">
+    <title>محاكي MQL5</title>
+    <link rel="manifest" href="manifest.json">
+    <link rel="apple-touch-icon" href="icon.png">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0D1117;
+            color: #fff;
+            min-height: 100vh;
+            padding-bottom: 40px;
+        }
+        .container { max-width: 500px; margin: 0 auto; padding: 16px; }
+
+        h1 { font-size: 24px; text-align: center; margin: 20px 0; color: #00D4AA; }
+
+        .card {
+            background: #161B22;
+            border-radius: 16px;
+            padding: 16px;
+            margin-bottom: 16px;
+            border: 1px solid #30363D;
+        }
+
+        .card-title {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            color: #C9D1D9;
+        }
+
+        textarea {
+            width: 100%;
+            min-height: 200px;
+            background: #0D1117;
+            border: 1px solid #30363D;
+            border-radius: 12px;
+            padding: 12px;
+            color: #7EE787;
+            font-family: 'SF Mono', monospace;
+            font-size: 13px;
+            resize: vertical;
+            direction: ltr;
+            text-align: left;
+        }
+
+        textarea:focus { outline: none; border-color: #00D4AA; }
+
+        .input-group {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .input-group label {
+            font-size: 15px;
+            color: #C9D1D9;
+        }
+
+        input, select {
+            background: #0D1117;
+            border: 1px solid #30363D;
+            border-radius: 10px;
+            padding: 10px 14px;
+            color: #fff;
+            font-size: 15px;
+            width: 140px;
+            text-align: center;
+        }
+
+        input:focus, select:focus { outline: none; border-color: #00D4AA; }
+
+        .presets {
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            padding-bottom: 8px;
+            margin-bottom: 8px;
+        }
+
+        .preset-btn {
+            background: #1F6FEB;
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            padding: 8px 16px;
+            font-size: 14px;
+            white-space: nowrap;
+            cursor: pointer;
+        }
+
+        .preset-btn:active { opacity: 0.7; }
+
+        .run-btn {
+            width: 100%;
+            background: #238636;
+            color: #fff;
+            border: none;
+            border-radius: 14px;
+            padding: 16px;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 8px;
+        }
+
+        .run-btn:disabled {
+            background: #8B949E;
+            cursor: not-allowed;
+        }
+
+        .run-btn:active:not(:disabled) { opacity: 0.8; }
+
+        .progress-container {
+            margin-top: 16px;
+            display: none;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #30363D;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: #00D4AA;
+            border-radius: 4px;
+            transition: width 0.3s;
+            width: 0%;
+        }
+
+        .progress-text {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 8px;
+            font-size: 13px;
+            color: #8B949E;
+        }
+
+        .log {
+            max-height: 150px;
+            overflow-y: auto;
+            background: #0D1117;
+            border-radius: 10px;
+            padding: 10px;
+            margin-top: 12px;
+            font-size: 12px;
+            color: #8B949E;
+            line-height: 1.6;
+        }
+
+        /* Results Modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.8);
+            z-index: 1000;
+            overflow-y: auto;
+        }
+
+        .modal-content {
+            background: #0D1117;
+            min-height: 100vh;
+            padding: 20px 16px 40px;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .modal-header h2 {
+            font-size: 20px;
+            color: #00D4AA;
+        }
+
+        .close-btn {
+            background: #30363D;
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            padding: 8px 16px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        .summary-card {
+            background: #161B22;
+            border-radius: 16px;
+            padding: 20px;
+            text-align: center;
+            margin-bottom: 20px;
+            border: 1px solid #30363D;
+        }
+
+        .summary-card.positive { border-color: #238636; background: rgba(35,134,54,0.1); }
+        .summary-card.negative { border-color: #DA3633; background: rgba(218,54,51,0.1); }
+
+        .summary-card h3 { font-size: 14px; color: #8B949E; margin-bottom: 8px; }
+        .summary-card .big-number { font-size: 28px; font-weight: 700; }
+        .summary-card .big-number.green { color: #3FB950; }
+        .summary-card .big-number.red { color: #F85149; }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .stat-box {
+            background: #161B22;
+            border-radius: 12px;
+            padding: 14px;
+            text-align: center;
+            border: 1px solid #30363D;
+        }
+
+        .stat-box .stat-label { font-size: 12px; color: #8B949E; margin-bottom: 6px; }
+        .stat-box .stat-value { font-size: 18px; font-weight: 700; }
+        .stat-box .stat-value.green { color: #3FB950; }
+        .stat-box .stat-value.red { color: #F85149; }
+
+        #equityChart {
+            width: 100%;
+            height: 220px;
+            background: #161B22;
+            border-radius: 12px;
+            margin-bottom: 20px;
+        }
+
+        .trades-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .trade-item {
+            background: #161B22;
+            border-radius: 12px;
+            padding: 14px;
+            margin-bottom: 10px;
+            border: 1px solid #30363D;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .trade-item .trade-info { flex: 1; }
+        .trade-item .trade-type {
+            display: inline-block;
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            margin-left: 6px;
+        }
+        .trade-item .trade-type.buy { background: #3FB950; }
+        .trade-item .trade-type.sell { background: #F85149; }
+        .trade-item .trade-details { font-size: 12px; color: #8B949E; margin-top: 4px; }
+        .trade-item .trade-profit { font-size: 16px; font-weight: 700; }
+        .trade-item .trade-profit.green { color: #3FB950; }
+        .trade-item .trade-profit.red { color: #F85149; }
+
+        .install-banner {
+            display: none;
+            background: #1F6FEB;
+            color: #fff;
+            padding: 12px 16px;
+            text-align: center;
+            font-size: 14px;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .install-banner button {
+            background: #fff;
+            color: #1F6FEB;
+            border: none;
+            border-radius: 6px;
+            padding: 4px 12px;
+            margin-right: 8px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div class="install-banner" id="installBanner">
+        📱 اضغط "شارك" ثم "إضافة للشاشة الرئيسية"
+        <button onclick="dismissBanner()">إخفاء</button>
+    </div>
+
+    <div class="container">
+        <h1>🎯 محاكي MQL5</h1>
+
+        <div class="card">
+            <div class="card-title">📝 كود الاستراتيجية (MQL5)</div>
+            <textarea id="codeEditor" spellcheck="false">input int MA_Period = 14;
+input double LotSize = 0.1;
+
+void OnTick() {
+    double ma = iMA(_Symbol, PERIOD_H1, MA_Period, 0, MODE_SMA, PRICE_CLOSE, 0);
+
+    if(Close[0] > ma && OrdersTotal() == 0) {
+        OrderSend(_Symbol, OP_BUY, LotSize, Ask, 3, 0, 0);
+    }
+
+    if(Close[0] < ma && OrdersTotal() > 0) {
+        OrderSelect(0, SELECT_BY_POS, MODE_TRADES);
+        OrderClose(OrderTicket(), OrderLots(), Bid, 3);
+    }
+}</textarea>
+        </div>
+
+        <div class="card">
+            <div class="card-title">⚡ اختصارات سريعة</div>
+            <div class="presets">
+                <button class="preset-btn" onclick="loadPreset('eurusd')">EURUSD</button>
+                <button class="preset-btn" onclick="loadPreset('xauusd')">XAUUSD</button>
+                <button class="preset-btn" onclick="loadPreset('gbpusd')">GBPUSD</button>
+                <button class="preset-btn" onclick="loadPreset('usdjpy')">USDJPY</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-title">⚙️ إعدادات الاختبار</div>
+            <div class="input-group">
+                <label>الزوج</label>
+                <input type="text" id="symbol" value="EURUSD">
+            </div>
+            <div class="input-group">
+                <label>الإطار الزمني</label>
+                <select id="timeframe">
+                    <option value="1m">1 دقيقة</option>
+                    <option value="5m">5 دقائق</option>
+                    <option value="15m">15 دقيقة</option>
+                    <option value="30m">30 دقيقة</option>
+                    <option value="1h" selected>1 ساعة</option>
+                    <option value="4h">4 ساعات</option>
+                    <option value="1d">يومي</option>
+                </select>
+            </div>
+            <div class="input-group">
+                <label>الفترة</label>
+                <select id="range">
+                    <option value="7d">أسبوع</option>
+                    <option value="1mo">شهر</option>
+                    <option value="3mo" selected>3 أشهر</option>
+                    <option value="6mo">6 أشهر</option>
+                    <option value="1y">سنة</option>
+                    <option value="2y">سنتين</option>
+                </select>
+            </div>
+            <div class="input-group">
+                <label>رأس المال ($)</label>
+                <input type="number" id="balance" value="10000">
+            </div>
+        </div>
+
+        <button class="run-btn" id="runBtn" onclick="runBacktest()">
+            ▶️ بدء المحاكاة
+        </button>
+
+        <div class="progress-container" id="progressContainer">
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <div class="progress-text">
+                <span id="progressPercent">0%</span>
+                <span id="tickCount">تيكات: 0</span>
+            </div>
+        </div>
+
+        <div class="log" id="log"></div>
+    </div>
+
+    <!-- Results Modal -->
+    <div class="modal-overlay" id="resultModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>📊 النتائج النهائية</h2>
+                <button class="close-btn" onclick="closeModal()">إغلاق</button>
+            </div>
+
+            <div id="summaryCard" class="summary-card">
+                <h3>الرصيد النهائي</h3>
+                <div class="big-number" id="finalBalance">$0.00</div>
+                <div style="margin-top:8px; font-size:14px;" id="netProfit">صافي الربح: $0.00</div>
+            </div>
+
+            <div class="stats-grid">
+                <div class="stat-box">
+                    <div class="stat-label">إجمالي الصفقات</div>
+                    <div class="stat-value" id="totalTrades">0</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">الصفقات الرابحة</div>
+                    <div class="stat-value green" id="winningTrades">0</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">الصفقات الخاسرة</div>
+                    <div class="stat-value red" id="losingTrades">0</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">نسبة الربح</div>
+                    <div class="stat-value" id="winRate">0%</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">عائد الاستثمار</div>
+                    <div class="stat-value" id="roi">0%</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">أقصى تراجع</div>
+                    <div class="stat-value red" id="maxDD">0%</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">عامل الربح</div>
+                    <div class="stat-value" id="profitFactor">0.00</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">متوسط الربح</div>
+                    <div class="stat-value" id="avgProfit">$0.00</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">نسبة شارب</div>
+                    <div class="stat-value" id="sharpe">0.00</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">الرصيد الأولي</div>
+                    <div class="stat-value" id="initialBal">$0</div>
+                </div>
+            </div>
+
+            <div class="card-title">📈 منحنى رأس المال</div>
+            <canvas id="equityChart"></canvas>
+
+            <div class="card-title">📋 سجل الصفقات</div>
+            <div class="trades-list" id="tradesList"></div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

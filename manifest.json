@@ -1,0 +1,22 @@
+{
+  "name": "محاكي MQL5",
+  "short_name": "MQL5",
+  "description": "اختبار استراتيجيات التداول باستخدام MQL5 وبيانات حقيقية",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#0D1117",
+  "theme_color": "#0D1117",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "icon.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icon.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
