@@ -24,7 +24,7 @@ These are stated at the top of the source file as well, because every number bel
 | A2 | `ACCOUNT_MARGIN_MODE_RETAIL_HEDGING` | On netting accounts the hedge sleeve is replaced by **delta reduction** (partial close of the book) and a one-time warning is logged — an opposite order is never sent where it would silently flatten the book |
 | A3 | Any account currency | Lot sizing uses `OrderCalcProfit()` first, then `SYMBOL_TRADE_TICK_VALUE`, then `SYMBOL_TRADE_CONTRACT_SIZE`. No hard-coded "$100 per lot" |
 | A4 | Any leverage | Every order is pre-checked with `OrderCalcMargin()` against `ACCOUNT_MARGIN_FREE` × `InpMarginCushion` |
-| A5 | Market or instant execution | Filling policy resolved per symbol by `CTrade::SetTypeFillingBySymbol()`; requotes/price-changed/off-quote are retried |
+| A5 | Market or instant execution | Requested filling is **IOC**: `ORDER_FILLING_IOC` is set when (and only when) the symbol advertises `SYMBOL_FILLING_IOC`; otherwise `CTrade::SetTypeFillingBySymbol()` resolves the policy per symbol and the effective policy is logged (no silent invention). Requotes/price-changed/off-quote are retried |
 | A6 | H1 ≈ 6 000 bars/year for gold (23 h × 5 d × 52 w) | `InpBarsPerYear` must be changed when `InpSignalTF` changes (annualized vol reporting and drift only — decisions use scale-free statistics) |
 | A7 | Signals read **closed bars only** (shift ≥ 1) | No repainting, no look-ahead; bar change is confirmed with an `iTime(symbol, tf, 0)` guard |
 | A8 | Swap read live from the position; commission/fees read from history deals (`DEAL_COMMISSION + DEAL_FEE`) and cached | `InpEstRoundTurnCommPerLot` is only a *pre-trade* cost estimate used by the cost-sanity gate |
@@ -101,7 +101,8 @@ Each pillar emits **bounded evidence** $e_p \in [-1,+1]$ (equivalently a probabi
 * A signal that does not belong to the current closed bar is **invalidated** (`g_signal.Reset()`), so no decision can ever be taken on stale statistics.
 * The single `iATR` handle is created in `OnInit` and released in `OnDeinit` — no static-handle-inside-function pattern anywhere.
 * Volumes are floored to `SYMBOL_VOLUME_STEP` and **rejected below `SYMBOL_VOLUME_MIN`**; they are never silently bumped.
-* Prices are normalized to `_Digits`; stops are validated against `SYMBOL_TRADE_STOPS_LEVEL` and `SYMBOL_TRADE_FREEZE_LEVEL`.
+* Prices are **tick-size aligned** to `SYMBOL_TRADE_TICK_SIZE` and then normalized to `_Digits` (`NormalizePrice` does both — decimal rounding alone is not proof of tick-size validity on symbols whose tick size is coarser than their point); stops are validated against `SYMBOL_TRADE_STOPS_LEVEL` and `SYMBOL_TRADE_FREEZE_LEVEL`. On the standard XAUUSD grid (digits = 2, tick size = 0.01) the alignment is an identity, so distances and the risk model are unchanged.
+* No `Sleep()` anywhere in event-handler paths: the retry pace is a non-blocking wall-clock gate (`GetTickCount64()`), so quote processing and the tester event loop are never frozen.
 
 ---
 
@@ -240,7 +241,7 @@ $$\boxed{\;\text{lots}=\Big\lfloor \frac{\text{riskMoney}}{\text{lossPerLot}\cdo
 
 Caps applied afterwards, in order: aggregate risk budget (`InpMaxTotalRiskPct` minus currently open risk), aggregate volume (`InpMaxTotalLots` minus open lots), broker `VOLUME_MAX`, and margin feasibility (`OrderCalcMargin` × `InpMarginCushion`). Because SLdist is ATR-scaled, $\text{lots}\propto 1/ATR$: every leg commits the **same money risk** regardless of the volatility regime — that is the volatility normalization.
 
-Stops and targets: $\text{SL}=\text{entry}\mp\text{SLdist}$, $\text{TP}=\text{entry}\pm\text{SLdist}\cdot\texttt{InpTP\_RR}$ (sign by direction), normalized to `_Digits` and re-validated against the broker stops level at send time.
+Stops and targets: $\text{SL}=\text{entry}\mp\text{SLdist}$, $\text{TP}=\text{entry}\pm\text{SLdist}\cdot\texttt{InpTP\_RR}$ (sign by direction), tick-size aligned and normalized to `_Digits`, then re-validated against the broker stops level at send time.
 
 ---
 
@@ -367,12 +368,21 @@ Day-start equity is anchored to the broker's `iTime(_Symbol, PERIOD_D1, 0)` bar 
 
 ## 9. Execution engineering
 
-* One `CTrade` object, magic-bound, deviation = `InpSlippagePoints`, filling resolved per symbol, synchronous mode.
-* Retry loop: `REQUOTE`, `PRICE_CHANGED`, `PRICE_OFF`, `TIMEOUT`, `CONNECTION`, `TOO_MANY_REQUESTS` are retried up to `InpOrderRetries` with `Sleep(InpRetryDelayMs)` on live accounts only (never in the tester). `INVALID_STOPS` triggers one stop-repair retry. `NO_MONEY`, `INVALID_VOLUME`, `LIMIT_VOLUME`, `TRADE_DISABLED`, `MARKET_CLOSED` abort immediately.
+* One `CTrade` object, magic-bound, deviation = `InpSlippagePoints`, synchronous mode (`SetAsyncMode(false)` ⇒ submission returns the server answer). Filling: **IOC when the symbol advertises `SYMBOL_FILLING_IOC`** (checked via the `SYMBOL_FILLING_MODE` bitmask in `OnInit`, logged); otherwise the standard-library per-symbol resolution is used and the effective policy is logged — a different filling mode is never silently invented. Note `CTrade::SetTypeFillingBySymbol()` alone would pick FOK first on dual-mode symbols, which would violate the IOC requirement.
+* Retry loop: `REQUOTE`, `PRICE_CHANGED`, `PRICE_OFF`, `TIMEOUT`, `CONNECTION`, `TOO_MANY_REQUESTS` are retried up to `InpOrderRetries`, paced by a **non-blocking** minimum interval `InpRetryIntervalMs` (wall-clock gate via `GetTickCount64()`; paced attempts are skipped, never blocked — no `Sleep()` in event handlers). `INVALID_STOPS` triggers one stop-repair retry. `NO_MONEY`, `INVALID_VOLUME`, `LIMIT_VOLUME`, `TRADE_DISABLED`, `MARKET_CLOSED`, `INVALID_FILL` abort immediately (a filling rejection is a policy conflict and is never retried into an invented mode).
 * Every retcode is mapped to a human-readable name (`RetcodeText`), and `POSITION_CLOSED` on a close request is treated as success.
 * Position scans are always `PositionsTotal()-1 → 0`, filtered by symbol **and** magic, using `PositionGetTicket(i)` (never the deprecated index-only access pattern).
 * Partial closes are normalized to the volume step; a remainder below `VOLUME_MIN` closes the whole leg only if it is ≥ 75 % of it, otherwise the action is skipped (never bumped).
 * `OnTimer` re-runs the light pass (guards + hedge lifecycle + stops) so protection continues when the quote feed stalls; it never opens entries.
+
+**Execution-safety static audit (2026-09-24).** A full static audit against MT5 execution-safety requirements (build 5260+ target, XAUUSD/IC Markets context, requested IOC filling) produced exactly four source changes; every other audited area was found already compliant and was left untouched (no-op is a valid outcome):
+
+1. `#property strict` added (required property; no behavioral effect in MQL5).
+2. `Sleep(InpRetryDelayMs)` inside the two retry loops replaced by a non-blocking wall-clock retry gate; the input is renamed `InpRetryIntervalMs` (semantics: minimum interval between attempts, live and tester alike). Retry counts and abort/repair semantics are unchanged.
+3. `NormalizePrice` now performs tick-size alignment *and* `_Digits` normalization (identity on the standard 0.01/2-digit gold grid; binds only where the broker tick size is coarser than the point).
+4. Filling policy honors the IOC requirement explicitly: IOC is selected only when the symbol advertises it (bitmask check), otherwise the standard-library per-symbol resolution runs and the effective policy is logged.
+
+Execution-level only — entry logic, scoring, sizing, SL/TP, pyramiding, hedge lifecycle, magic/symbol ownership and trade frequency are unchanged.
 * `OnTester()` returns a composite objective (PF + Sharpe + 1.5·RecoveryFactor − 0.05·relative DD, with thin-sample and zero-loser discounts) so the optimizer cannot win by trading once.
 
 ---
@@ -497,7 +507,7 @@ Group headings match the `input group` blocks in the source, so the dialog layou
 | `InpMarginCushion` | double | `3.00` | Required free margin / needed margin |
 | `InpSlippagePoints` | int | `30` | Max deviation (points) |
 | `InpOrderRetries` | int | `3` | Retries on requote/price-changed/timeout |
-| `InpRetryDelayMs` | int | `250` | Delay between retries (live only) |
+| `InpRetryIntervalMs` | int | `250` | Min interval between retries, ms (non-blocking gate — no `Sleep()`) |
 | `InpEstRoundTurnCommPerLot` | double | `7.00` | Estimated round-turn commission per lot (USD) |
 
 **7 -- Dynamic pyramiding (geometric decay + fractional Kelly)**
@@ -773,11 +783,12 @@ Direction balance was 45.9–50.7 % long across runs — no structural long/shor
 | Check | Result |
 |---|---|
 | Brace / parenthesis / bracket balance (comments and literals stripped) | 0 / 0 / 0 |
-| `StringFormat` / `PrintFormat` specifier-vs-argument count (71 call sites, positional) | 0 mismatches |
+| `StringFormat` / `PrintFormat` specifier-vs-argument count (73 call sites, positional) | 0 mismatches |
 | Undefined function calls (excluding the MQL5 built-in whitelist and `CTrade` methods verified against the official class reference) | none |
 | Unused inputs / unused globals (dead code) | 0 / 0 (97 inputs, 36 globals, all referenced) |
 | Non-ASCII characters (encoding safety in MetaEditor) | 0 |
-| MQL4-only API (`OrderSend`, `OrderSelect`, `Close[]`, `Point`, `Digits`, `#property strict`, `iMA` as a value) | none |
+| MQL4-only API (`OrderSend`, `OrderSelect`, `Close[]`, `Point`, `Digits`, `iMA` as a value) | none |
+| `#property strict` | present as required (MQL5 is always strict; the directive has no behavioral effect and is accepted by the compiler — verified against MQL5 forum/moderator statements, not against a local compile) |
 | `TRADE_RETCODE_*`, `ENUM_STATISTICS`, `ENUM_SYMBOL_INFO_*`, `DEAL_*`, `POSITION_*` identifiers | all from the documented enumerations |
 
 > The Python port is a *verification harness*, not part of the deliverable; it is not shipped in the repository. The MQL5 file must still be compiled in MetaEditor before use — expect 0 errors; the only warnings that can appear are benign "declaration hides a member" style notices from local loop variables.

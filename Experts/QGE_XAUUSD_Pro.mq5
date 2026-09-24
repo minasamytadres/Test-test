@@ -6,6 +6,7 @@
 #property copyright   "Quantitative Gold Edge (QGE) -- built on Arena.ai Agent Mode"
 #property link        "https://arena.ai"
 #property version     "1.00"
+#property strict
 #property description "Indicator-free statistical EA for XAUUSD. The signal is a weighted probabilistic fusion of four"
 #property description "independent pillars: (1) Yang-Zhang / Garman-Klass realized-volatility regime plus variance-ratio"
 #property description "persistence, (2) rolling OLS slope with R^2 and Student-t significance, (3) OLS-residual z-score"
@@ -33,9 +34,11 @@
 //                   other account currency (no hard-coded $100/lot).
 //  A4. Leverage   : Any. Margin feasibility is verified with
 //                   OrderCalcMargin() before every send.
-//  A5. Execution  : Market execution or instant execution both supported;
-//                   filling policy resolved per symbol via
-//                   CTrade::SetTypeFillingBySymbol(). Slippage in points.
+//  A5. Execution  : Market execution or instant execution both supported.
+//                   Requested filling policy is IOC: it is selected ONLY
+//                   when the symbol advertises SYMBOL_FILLING_IOC, otherwise
+//                   CTrade::SetTypeFillingBySymbol() resolves the policy per
+//                   symbol and the resolution is logged. Slippage in points.
 //  A6. Timeframe  : Signal timeframe defaults to H1 (~6000 bars/year for
 //                   gold: 23h x 5d x 52w). InpBarsPerYear must match the
 //                   chosen timeframe when annualized vol is inspected.
@@ -133,7 +136,7 @@ input bool             InpKillSwitchCloseAll     = false;    // Kill switch also
 input double           InpMarginCushion          = 3.00;     // Required free margin / needed margin
 input int              InpSlippagePoints         = 30;       // Max deviation (points)
 input int              InpOrderRetries           = 3;        // Retries on requote/price-changed/timeout
-input int              InpRetryDelayMs           = 250;      // Delay between retries (live only)
+input int              InpRetryIntervalMs        = 250;      // Min interval between retries, ms (non-blocking gate)
 input double           InpEstRoundTurnCommPerLot = 7.00;     // Estimated round-turn commission per lot (USD)
 
 input group "7 -- Dynamic pyramiding (geometric decay + fractional Kelly)"
@@ -407,7 +410,28 @@ double NormalizeVolume(const double raw, bool &ok)
    return(v);
   }
 
-double NormalizePrice(const double p) { return(NormalizeDouble(p, g_digits)); }
+//--- Align a price to the broker grid. TWO SEPARATE CONCERNS, both applied:
+//      (1) TICK-SIZE ALIGNMENT: snap p to the nearest multiple of
+//          SYMBOL_TRADE_TICK_SIZE. NormalizeDouble() alone does NOT prove
+//          tick-size validity (a symbol can quote a tick size coarser than
+//          its decimal precision, e.g. tick 0.05 with 2 digits), and an
+//          unaligned SL/TP is rejected with TRADE_RETCODE_INVALID_PRICE /
+//          INVALID_STOPS on such symbols.
+//      (2) DECIMAL PRECISION: NormalizeDouble() to _Digits for the request.
+//    On the supplied context (digits=2, tick size=0.01) the snap is an
+//    identity, so the risk model and every distance is bit-for-bit unchanged
+//    there; the alignment only binds where the broker grid is coarser.
+//    The caller's stops-level repair (MinStopDistance) still runs AFTER this
+//    function in OpenMarket, so a snap can never push a stop inside the
+//    broker minimum distance.
+double NormalizePrice(const double p)
+  {
+   if(!IsFiniteD(p) || p <= 0.0) return(0.0);
+   double a = p;
+   if(g_tickSize > 0.0)
+      a = MathRound(p/g_tickSize)*g_tickSize;          // tick-size alignment
+   return(NormalizeDouble(a, g_digits));              // decimal precision
+  }
 
 //--- minimum legal stop distance in price units (broker stops level + buffer)
 double MinStopDistance()
@@ -465,6 +489,27 @@ bool IsRetryableRetcode(const uint rc)
 bool IsSuccessRetcode(const uint rc)
   {
    return(rc==TRADE_RETCODE_DONE || rc==TRADE_RETCODE_DONE_PARTIAL || rc==TRADE_RETCODE_PLACED);
+  }
+
+//--- NON-BLOCKING RETRY PACING (replaces Sleep() inside event handlers).
+//    Sleep() must never be called from OnTick()/OnTimer() paths: it freezes
+//    the whole event loop, stalls quote processing and is forbidden in the
+//    Strategy Tester. The retry pace is therefore a wall-clock GATE: the
+//    retry loop keeps its original bounded attempt count (InpOrderRetries)
+//    and simply skips the send until InpRetryIntervalMs of wall time has
+//    elapsed since the previous attempt. GetTickCount() wraps at ~49.7 days;
+//    unsigned subtraction yields the correct elapsed time across one wrap.
+ulong g_nextRetryAllowedMs = 0;
+
+bool RetryPaceDue()
+  {
+   if(g_nextRetryAllowedMs==0) return(true);
+   ulong now = GetTickCount64();
+   return(now >= g_nextRetryAllowedMs);
+  }
+void RetryPaceArm()
+  {
+   if(InpRetryIntervalMs>0) g_nextRetryAllowedMs = GetTickCount64() + (ulong)InpRetryIntervalMs;
   }
 
 //--- terminal global variables (persist peak equity / R anchor across re-inits)
@@ -1527,6 +1572,14 @@ public:
 
       for(int attempt=1; attempt<=attempts; attempt++)
         {
+         //--- non-blocking pace gate: a retry is only sent once the minimum
+         //    inter-attempt interval has elapsed (no Sleep in event handlers)
+         if(attempt>1 && !RetryPaceDue())
+           {
+            VerboseT(StringFormat("entry retry %d/%d paced: waiting for the %d ms retry gate",
+                                  attempt,attempts,InpRetryIntervalMs),5);
+            continue;
+           }
          double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
          double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
          double price = (dir>0) ? ask : bid;
@@ -1578,7 +1631,7 @@ public:
             continue;
            }
          if(!IsRetryableRetcode(rc)) return(false);        // permanent rejection
-         if(!MQLInfoInteger(MQL_TESTER) && InpRetryDelayMs>0) Sleep(InpRetryDelayMs);
+         RetryPaceArm();                                   // non-blocking pace gate
         }
       return(false);
      }
@@ -1590,6 +1643,7 @@ public:
       int attempts = (int)MathMax(InpOrderRetries,1);
       for(int attempt=1; attempt<=attempts; attempt++)
         {
+         if(attempt>1 && !RetryPaceDue()) continue;        // paced, non-blocking
          if(!PositionSelectByTicket(ticket))
            {
             UnmarkHedgeTicket(ticket);
@@ -1611,7 +1665,7 @@ public:
                      attempt, attempts, ticket, rc2, RetcodeText(rc2), reason);
          if(rc2==TRADE_RETCODE_POSITION_CLOSED) { UnmarkHedgeTicket(ticket); return(true); }
          if(!IsRetryableRetcode(rc2)) return(false);
-         if(!MQLInfoInteger(MQL_TESTER) && InpRetryDelayMs>0) Sleep(InpRetryDelayMs);
+         RetryPaceArm();                                   // non-blocking pace gate
         }
       return(false);
      }
@@ -2879,11 +2933,31 @@ int OnInit()
             "The hedge sleeve is replaced by delta reduction (partial book close) ",
             "so no opposite position is ever mis-interpreted as a netting flip.");
 
-   //--- trade object: magic isolation, deviation, filling policy
+   //--- trade object: magic isolation, deviation, filling policy.
+   //    REQUESTED FILLING = IOC. IOC is selected ONLY when this symbol
+   //    actually advertises it: SYMBOL_FILLING_MODE is a bitmask
+   //    (SYMBOL_FILLING_FOK=1, SYMBOL_FILLING_IOC=2) and
+   //    CTrade::SetTypeFillingBySymbol() resolves FOK FIRST when a symbol
+   //    supports both, which would silently violate the IOC requirement.
+   //    When IOC is not advertised we do NOT invent a preference: the
+   //    standard-library per-symbol resolution is used and the effective
+   //    policy is logged so the fallback is explicit, never silent.
    g_trade.SetExpertMagicNumber((ulong)InpMagicNumber);
    g_trade.SetDeviationInPoints((ulong)MathMax(InpSlippagePoints,0));
-   g_trade.SetTypeFillingBySymbol(_Symbol);
-   g_trade.SetAsyncMode(false);
+   uint fillFlags = (uint)SymbolInfoInteger(_Symbol,SYMBOL_FILLING_MODE);
+   if((fillFlags & SYMBOL_FILLING_IOC)==SYMBOL_FILLING_IOC)
+     {
+      g_trade.SetTypeFilling(ORDER_FILLING_IOC);           // requested policy honored
+      Print("QGE filling policy: IOC (symbol advertises SYMBOL_FILLING_IOC, flags=",fillFlags,")");
+     }
+   else
+     {
+      bool resolved = g_trade.SetTypeFillingBySymbol(_Symbol);
+      PrintFormat("QGE filling policy: IOC NOT supported by %s (flags=%u) -> per-symbol resolution %s => %s",
+                  _Symbol, fillFlags, resolved ? "succeeded" : "failed (CTrade default retained)",
+                  g_trade.RequestTypeFillingDescription());
+     }
+   g_trade.SetAsyncMode(false);                            // synchronous: submission == server answer
 
    //--- ONE indicator handle for the whole life of the EA
    if(!g_engine.Init()) return(INIT_FAILED);
