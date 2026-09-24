@@ -198,7 +198,6 @@ uint     g_fillFlags     = 0;
 ENUM_ORDER_TYPE_FILLING g_fillPolicy = ORDER_FILLING_IOC;
 int      g_hATR_H1       = INVALID_HANDLE;
 int      g_hATR_D1       = INVALID_HANDLE;
-ulong    g_requestSeq    = 0;      // unique client request id source
 datetime g_lastDecision  = 0;      // batch decision throttle
 datetime g_lastDayKey    = 0;      // day anchor for the daily guards
 double   g_dayStartEquity= 0.0;    // equity at server day start
@@ -283,21 +282,16 @@ double AtrValue(const int handle)
   }
 
 //==================================================================
-//  4. FORWARD DECLARATIONS (value globals, referenced by the classes)
+//  4. GLOBAL OBJECTS -- DECLARED AFTER THEIR CLASS BODIES
+//
+//  MQL5 does NOT accept C++ style forward declarations: a line such as
+//  "class C_Telemetry;" declares a type that cannot be instantiated
+//  (compiler: "undefined class cannot be used"). Every global object is
+//  therefore defined immediately after its own class body, and the
+//  classes are ordered so that each one only refers to components that
+//  are already complete (the cross-component work is passed as
+//  reference parameters, never as an early global instance).
 //==================================================================
-class C_Telemetry;
-class C_OrderBookScanner;
-class C_HFTExecution;
-class C_SafetyManager;
-class C_AggressionBalancer;
-class C_AdaptiveHedge;
-
-C_Telemetry          g_telem;
-C_OrderBookScanner   g_scan;
-C_HFTExecution       g_exec;
-C_SafetyManager      g_safe;
-C_AggressionBalancer g_bal;
-C_AdaptiveHedge      g_hedge;
 
 //==================================================================
 //  5. C_Telemetry -- metrics, latency percentiles, CSV, compliance
@@ -644,6 +638,8 @@ public:
                           m_shutdown ? " [SHUTDOWN]" : (m_throttled ? " [THROTTLED]" : "")));
      }
   };
+C_Telemetry          g_telem;
+
 
 //==================================================================
 //  6. C_OrderBookScanner -- legal microstructure signal engine
@@ -950,6 +946,8 @@ public:
    double            SpreadMom()   const { return(m_spreadMom);   }
    int               Levels()      const { return(m_levels);      }
   };
+C_OrderBookScanner   g_scan;
+
 
 //==================================================================
 //  7. C_HFTExecution -- ultra-low-latency execution manager
@@ -996,6 +994,30 @@ private:
       for(int i=0;i<EXEC_INFLIGHT_SLOTS;i++)
          if(m_inflight[i].used && m_inflight[i].id == id) return(i);
       return(-1);
+     }
+   //--- fallback correlation for the (rare) case where the terminal reports
+   //    request_id == 0: match the OLDEST unanswered request that has the same
+   //    order type, the same requested volume and the same requested price.
+   //    All three come from the measured request, not from assumptions.
+   int               FindInflightFingerprint(const int otype, const double volume,
+                                             const double price)
+     {
+      int   best     = -1;
+      ulong bestSend = 0;
+      for(int i=0;i<EXEC_INFLIGHT_SLOTS;i++)
+        {
+         if(!m_inflight[i].used || m_inflight[i].answered) continue;
+         if((int)m_inflight[i].otype != otype) continue;
+         if(MathAbs(m_inflight[i].req_volume - volume) > 1.0e-9) continue;
+         if(price > 0.0 && m_inflight[i].req_price > 0.0 &&
+            MathAbs(m_inflight[i].req_price - price) > g_tickSize) continue;
+         if(best < 0 || m_inflight[i].send_ms < bestSend)
+           {
+            best     = i;
+            bestSend = m_inflight[i].send_ms;
+           }
+        }
+      return(best);
      }
    int               FindPegByTicket(const ulong ticket)
      {
@@ -1081,13 +1103,6 @@ private:
         }
      }
 
-   ulong             NextRequestId()
-     {
-      g_requestSeq++;
-      if(g_requestSeq == 0) g_requestSeq = 1;          // 0 means "unset"
-      return(g_requestSeq);
-     }
-
    double            JitteredDeviation() const
      {
       if(InpDeviationPoints == 0) return(0.0);
@@ -1107,11 +1122,17 @@ private:
          if(InpVerboseLog) Print("EXEC: placement refused - LegalComplianceFlag shutdown latched");
          return(false);
         }
-      req.id = NextRequestId();
+      //--- MqlTradeRequest has NO client-side id field (verified against the
+      //    MQL5 reference: action/magic/order/symbol/volume/price/stoplimit/
+      //    sl/tp/deviation/type/type_filling/type_time/expiration/comment/
+      //    position/position_by only). Correlation therefore uses the
+      //    DOCUMENTED path: the terminal assigns MqlTradeResult::request_id
+      //    when the request is dispatched and echoes it back inside the
+      //    MqlTradeResult parameter of OnTradeTransaction() for
+      //    TRADE_TRANSACTION_REQUEST.
       int slot = FindFreeInflight();
       m_inflight[slot].Clear();
       m_inflight[slot].used       = true;
-      m_inflight[slot].id         = req.id;
       m_inflight[slot].send_ms    = GetTickCount64();
       m_inflight[slot].req_volume = reqVolume;
       m_inflight[slot].req_price  = req.price;
@@ -1129,7 +1150,7 @@ private:
                      _LastError, (int)req.type, reqVolume);
          return(false);
         }
-      if(res.request_id != 0) m_inflight[slot].id = res.request_id;   // server-echoed id wins
+      m_inflight[slot].id = (ulong)res.request_id;     // id assigned by the terminal
       m_tel.NotePlacement();
       return(true);
      }
@@ -1493,10 +1514,12 @@ public:
      {
       if(trans.type == TRADE_TRANSACTION_REQUEST)
         {
-         ulong id = result.request_id;
-         if(id == 0) id = request.id;
-         int idx = FindInflightById(id);
+         ulong id  = (ulong)result.request_id;
+         int   idx = FindInflightById(id);
+         if(idx < 0)
+            idx = FindInflightFingerprint((int)request.type, request.volume, request.price);
          if(idx < 0) return;                            // not ours (or already released)
+         if(id == 0) id = m_inflight[idx].id;
          SInFlight rec = m_inflight[idx];
          m_inflight[idx].answered = true;
          m_inflight[idx].done_ms  = GetTickCount64();
@@ -1788,6 +1811,8 @@ public:
 
    int               PegsResting() const { return(CountAlivePegs()); }
   };
+C_HFTExecution       g_exec;
+
 
 //==================================================================
 //  8. C_SafetyManager -- gates + legal-compliance monitor
@@ -2076,6 +2101,8 @@ public:
       return(true);
      }
   };
+C_SafetyManager      g_safe;
+
 
 //==================================================================
 //  9. C_AggressionBalancer -- decision brain
@@ -2185,9 +2212,9 @@ public:
    double            Score()        const { return(m_score);        }
    ENUM_AGGR_MODE    Mode()         const { return(m_mode);         }
    double            PassiveRatio() const { return(m_passiveRatio); }
-   string            ModeName()     const
+   string            ModeNameOf(const ENUM_AGGR_MODE m) const
      {
-      switch(m_mode)
+      switch(m)
         {
          case AGGR_MAX:    return("MAX");
          case AGGR_HIGH:   return("HIGH");
@@ -2195,7 +2222,10 @@ public:
          default:          return("DEFENSIVE");
         }
      }
+   string            ModeName()     const { return(ModeNameOf(m_mode)); }
   };
+C_AggressionBalancer g_bal;
+
 
 //==================================================================
 //  10. C_AdaptiveHedge -- probabilistic risk compression (defense)
@@ -2502,6 +2532,8 @@ public:
       return(m_bornTime>0 ? (double)(TimeCurrent()-m_bornTime)/60.0 : 0.0);
      }
   };
+C_AdaptiveHedge      g_hedge;
+
 
 //==================================================================
 //  11. ORCHESTRATION
@@ -2753,7 +2785,7 @@ void SelfTest(const int mode)
       double passiveA = g_bal.PassiveRatioFromInputs(modeA, false, 0.0);
       PrintFormat("SELFTEST A: edge expected>=55 actual=%.1f | dir expected=+1 actual=%+d", edgeA, dirA);
       PrintFormat("SELFTEST A: score expected>=60 actual=%.1f | mode=%s passiveRatio=%.2f (expected<=0.40)",
-                  scoreA, EnumToString(modeA), passiveA);
+                  scoreA, g_bal.ModeNameOf(modeA), passiveA);
 
       //--- fill accounting: 3 requests, 2 filled => MicroFillRate = 2/3
       g_telem.NotePlacement(); g_telem.NoteVolume(0.01, 0.01, false); g_telem.NoteIOC(true);
