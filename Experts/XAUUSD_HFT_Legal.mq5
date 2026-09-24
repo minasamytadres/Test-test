@@ -49,7 +49,7 @@ input double           InpTargetVolume          = 0.30;    // Target volume per 
 input int              InpMicroBullets          = 5;       // Micro-orders per batch N [3..9]
 input double           InpMaxTotalLots          = 3.00;    // Hard cap, own positions (lots)
 input double           InpMaxDailyVolume        = 20.00;   // Hard cap, own OPENED volume per day (lots)
-input int              InpMinSecBetweenBatches  = 3;       // Min seconds between batch decisions
+input int              InpMinSecBetweenBatches  = 1;       // Min seconds between batch decisions
 input bool             InpStartupIgnite         = true;    // One-time bootstrap batch when SessionTrades==0
 input double           InpBootstrapVolumeFrac   = 0.20;    // Bootstrap volume fraction [0.10..0.30]
 
@@ -84,6 +84,7 @@ input double           InpW_SessionWinRate      = 0.15;    // w2: SessionWinRate
 input double           InpMaxAggression         = 0.80;    // Max aggression cap [0..1]
 input double           InpMinAggression         = 0.20;    // Min aggression floor [0..1]
 input double           InpPassiveRatioFloor     = 0.25;    // Minimum passive (peg) share of size
+input double           InpMinEdgeToTrade        = 15.0;    // Min LiquidityEdgeScore to trade (no-DOM ceiling 65)
 
 input group "4 -- Adaptive hedge (risk compression)"
 input double           InpE_ThresholdUSD        = 25000.0; // E_threshold: toxic net notional (USD)
@@ -103,7 +104,7 @@ input int              InpSelfTestMode          = 0;       // 0=off 1=MicroImpul
 input bool             InpVerboseLog            = true;    // Verbose mechanism logging
 
 input group "6 -- Safety gates"
-input int              InpMaxSpreadPoints       = 60;      // Spread gate (points)
+input int              InpMaxSpreadPoints       = 80;      // Spread gate (points)
 input double           InpCriticalMarginLevel   = 250.0;   // Critical margin level (%) -> DEFENSIVE
 input double           InpHealthyMarginLevel    = 900.0;   // Margin level mapped to 1.00
 input double           InpDailyLossLimitPct     = 5.0;     // Daily loss guard (% of day-start equity)
@@ -188,7 +189,6 @@ uint     g_fillFlags     = 0;
 ENUM_ORDER_TYPE_FILLING g_fillPolicy = ORDER_FILLING_IOC;
 int      g_hATR_H1       = INVALID_HANDLE;
 int      g_hATR_D1       = INVALID_HANDLE;
-bool     g_bookSubscribed= false;
 ulong    g_requestSeq    = 0;      // unique client request id source
 datetime g_lastDecision  = 0;      // batch decision throttle
 datetime g_lastDayKey    = 0;      // day anchor for the daily guards
@@ -197,6 +197,7 @@ double   g_dayVolume     = 0.0;    // own filled volume today (lots)
 bool     g_igniteUsed    = false;  // StartupIgnite consumed
 bool     g_ready         = false;  // init completed successfully
 int      g_lastCommentSec= -1;     // Comment() throttle
+string   g_lastGateReason= "";     // why the last entry attempt was blocked (chart + log)
 
 //==================================================================
 //  3. MATH / NORMALIZATION PRIMITIVES
@@ -347,6 +348,8 @@ private:
    bool              m_throttled;            // auto-throttle active
    bool              m_shutdown;             // hard shutdown active
 
+   void              ResetFileHandle(int &h) { if(h != INVALID_HANDLE) { FileClose(h); h = INVALID_HANDLE; } }
+
    int               CountInWindow(const ulong &ring[], const int n,
                                    const ulong nowSec, const ulong windowSec) const
      {
@@ -401,7 +404,6 @@ public:
                 "HedgeEfficiency","Drawdown_Recovery_Time","CancellationRate","LegalComplianceFlag");
       return(true);
      }
-   void              ResetFileHandle(int &h) { if(h != INVALID_HANDLE) { FileClose(h); h = INVALID_HANDLE; } }
    void              CloseLog()
      {
       if(m_file != INVALID_HANDLE) { FileFlush(m_file); FileClose(m_file); m_file = INVALID_HANDLE; }
@@ -562,7 +564,6 @@ public:
          m_ddStart=0; m_ddPeakLoss=0.0;
         }
      }
-   double            LastRecoverySec() const { return(m_lastRecoverySec); }
    double            LastDealTime()    const { return(m_dealN>0 ? m_dealT[m_dealN-1] : 0.0); }
    int               DealSamples()     const { return(m_dealN); }
 
@@ -643,7 +644,6 @@ public:
 //     metric    : LiquidityEdgeScore in [0,100], BookDir in {-1,0,+1}
 //==================================================================
 #define SCAN_MAX_TICKS  512
-#define SCAN_MAX_BOOK   256
 
 class C_OrderBookScanner
   {
@@ -669,7 +669,6 @@ private:
    double            m_tickRule;        // net lift in [-1,1]
 
    double            m_sprT[SCAN_MAX_TICKS];
-   datetime          m_sprTime[SCAN_MAX_TICKS];
    int               m_sprN;
    int               m_sprIdx;
    double            m_spreadMom;       // normalized spread slope
@@ -685,9 +684,8 @@ private:
       m_tickIdx = (m_tickIdx + 1) % SCAN_MAX_TICKS;
       if(m_tickN < SCAN_MAX_TICKS) m_tickN++;
      }
-   void              PushSpread(const datetime t, const double s)
+   void              PushSpread(const double s)
      {
-      m_sprTime[m_sprIdx] = t;
       m_sprT[m_sprIdx]    = s;
       m_sprIdx = (m_sprIdx + 1) % SCAN_MAX_TICKS;
       if(m_sprN < SCAN_MAX_TICKS) m_sprN++;
@@ -704,8 +702,6 @@ public:
       m_edge=0.0; m_dir=0;
       ArrayInitialize(m_tickT,0); ArrayInitialize(m_tickP,0.0); ArrayInitialize(m_tickFlags,0);
       ArrayInitialize(m_sprT,0.0);
-      for(int i=0;i<SCAN_MAX_TICKS;i++) { m_sprTime[i]=0; m_tickT[i]=0; }
-      ArrayInitialize(m_tickT,0);
      }
 
    bool              Subscribe()
@@ -722,7 +718,6 @@ public:
       if(m_subscribed) { MarketBookRelease(_Symbol); m_subscribed=false; }
       m_bookValid=false;
      }
-   bool              Subscribed() const { return(m_subscribed); }
 
    void              OnBook(const string &symbol)
      {
@@ -769,7 +764,7 @@ public:
      {
       if(tick.bid <= 0.0 || tick.ask <= 0.0) return;
       PushTick(tick.time, tick.bid, (int)tick.flags);
-      PushSpread(tick.time, tick.ask - tick.bid);
+      PushSpread(tick.ask - tick.bid);
       ComputeVelocity();
       ComputeTickRule();
       ComputeSpreadMom();
@@ -858,8 +853,26 @@ public:
       double velN = ClampD(SafeDiv(tickVelocity, MathMax(InpTickVelocityRef,1.0e-6), 0.0), 0.0, 1.0);
       double ruleN= ClampD(MathAbs(tickRule), 0.0, 1.0);
       double sprN = ClampD(1.0 - MathAbs(spreadMom), 0.0, 1.0);   // widening spread = worse
-      double conf = bookUsable ? 1.00 : 0.65;                     // DOM evidence > tick-flow only
-      double score = conf * (0.35*imbN + 0.20*depN + 0.15*velN + 0.20*ruleN + 0.10*sprN) * 100.0;
+      //--- evidence-weighted renormalization: depth has NO meaning without a
+      //    DOM, so its weight is redistributed over the components that do
+      //    carry evidence. Scoring a missing DOM as "zero depth" would cap
+      //    the edge at 52/100 and make entries mathematically impossible on
+      //    brokers that do not publish a book -- i.e. the engine would sit
+      //    idle forever. With a DOM the weights sum to 1.00 and the value is
+      //    unchanged (0.35+0.20+0.15+0.20+0.10).
+      double wImb, wDep, wVel, wRule, wSpr;
+      if(bookUsable)                                      // full DOM evidence
+        {
+         wImb=0.35; wDep=0.20; wVel=0.15; wRule=0.20; wSpr=0.10;
+        }
+      else                                                // tick-flow fallback: no depth evidence
+        {
+         wImb=0.00; wDep=0.00; wVel=0.35; wRule=0.40; wSpr=0.25;
+        }
+      double wSum  = wImb + wDep + wVel + wRule + wSpr;   // = 1.00 in both schemes
+      double raw   = (wImb*imbN + wDep*depN + wVel*velN + wRule*ruleN + wSpr*sprN)/MathMax(wSum,1.0e-9);
+      double conf  = bookUsable ? 1.00 : 0.65;            // DOM evidence is worth more than ticks
+      double score = conf * raw * 100.0;
 
       int dImb  = (imbalance >  1.0e-9) ?  1 : ((imbalance < -1.0e-9) ? -1 : 0);
       int dRule = (tickRule    >  1.0e-9) ?  1 : ((tickRule    < -1.0e-9) ? -1 : 0);
@@ -926,10 +939,7 @@ public:
    double            TickVelocity()const { return(m_tickVelocity);}
    double            TickRule()    const { return(m_tickRule);    }
    double            SpreadMom()   const { return(m_spreadMom);   }
-   double            TopBidVol()   const { return(m_topBidVol);   }
-   double            TopAskVol()   const { return(m_topAskVol);   }
    int               Levels()      const { return(m_levels);      }
-   bool              BookValid()   const { return(m_bookValid);   }
   };
 
 //==================================================================
@@ -1357,6 +1367,7 @@ public:
          double moveTicks = SafeDiv(MathAbs(target - m_pegs[i].price), g_tickSize, 0.0);
          bool   aged      = (InpPegMaxAgeSec > 0 &&
                              (int)(TimeCurrent() - m_pegs[i].placed) >= InpPegMaxAgeSec);
+         //--- spec-named execution-speed metrics are read from C_Telemetry
          bool   due       = ((int)(nowMs - m_pegs[i].last_reprice_ms) >=
                              1000*MathMax(InpPegMinRepriceSec,1));
          if(!aged && !(due && moveTicks >= (double)MathMax(InpPegMinMoveTicks,1))) continue;
@@ -1405,7 +1416,17 @@ public:
          if(m_pegs[i].ticket <= 1) continue;
          if(InpPegMaxAgeSec > 0 &&
             (int)(TimeCurrent() - m_pegs[i].placed) >= InpPegMaxAgeSec)
+           {
+            //--- FREEZE LEVEL: a resting order inside the freeze distance cannot
+            //    be deleted; the attempt is skipped instead of being rejected
+            MqlTick tk;
+            if(g_freezeLevel > 0 && SymbolInfoTick(_Symbol, tk) && tk.bid > 0.0)
+              {
+               double distPts = MathAbs(tk.bid - m_pegs[i].price)/g_point;
+               if(distPts < (double)g_freezeLevel) continue;
+              }
             CancelPegIndex(i, "peg-max-resting-age");
+           }
         }
       //--- server-side orphans: own pending orders not tracked locally
       int total = OrdersTotal();
@@ -1671,7 +1692,7 @@ public:
       req.deviation    = InpDeviationPoints;
       req.type         = isBuy ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
       req.type_filling = g_fillPolicy;
-      req.magic        = PositionGetInteger(POSITION_MAGIC);
+      req.magic        = (ulong)PositionGetInteger(POSITION_MAGIC);
       req.comment      = "HFT-C";
 
       //--- closes are risk-reducing: synchronous OrderSend() is used so the
@@ -1733,8 +1754,6 @@ public:
      }
 
    int               PegsResting() const { return(CountAlivePegs()); }
-   double            LatencyAvgMs()      { return(m_tel.AvgLatency()); }
-   double            LatencyP95Ms()      { return(m_tel.P95Latency()); }
   };
 
 //==================================================================
@@ -2060,7 +2079,6 @@ public:
    double            Score()        const { return(m_score);        }
    ENUM_AGGR_MODE    Mode()         const { return(m_mode);         }
    double            PassiveRatio() const { return(m_passiveRatio); }
-   bool              IgniteArmed()  const { return(m_igniteArmed);  }
    string            ModeName()     const
      {
       switch(m_mode)
@@ -2098,7 +2116,6 @@ private:
    datetime          m_lastDDSample;
    double            m_lastEquity;
    double            m_prevDDv;
-   double            m_equityPeak;
    double            m_mainPeakLoss;
    datetime          m_lastLog;            // throttle for deferred-hedge notices
 
@@ -2108,13 +2125,12 @@ public:
       m_active=false; m_bornTime=0; m_bornLots=0.0; m_closedLots=0.0;
       m_slicesDone=0; m_hedgeSide=0;
       m_lastDDSample=0; m_lastEquity=0.0; m_prevDDv=0.0;
-      m_equityPeak=0.0; m_mainPeakLoss=0.0; m_lastLog=0;
+      m_mainPeakLoss=0.0; m_lastLog=0;
      }
 
    void              Init()
      {
       m_lastEquity   = AccountInfoDouble(ACCOUNT_EQUITY);
-      m_equityPeak   = m_lastEquity;
       m_lastDDSample = TimeCurrent();
       m_prevDDv      = 0.0;
      }
@@ -2184,7 +2200,6 @@ public:
       datetime now = TimeCurrent();
       double   equity = AccountInfoDouble(ACCOUNT_EQUITY);
       double   margin = AccountInfoDouble(ACCOUNT_MARGIN);
-      if(equity > m_equityPeak) m_equityPeak = equity;
 
       double atrH1 = AtrValue(g_hATR_H1);
       double atrD1 = AtrValue(g_hATR_D1);
@@ -2380,16 +2395,37 @@ public:
      {
       return(m_bornTime>0 ? (double)(TimeCurrent()-m_bornTime)/60.0 : 0.0);
      }
-   double            MainPeakLoss() const { return(m_mainPeakLoss); }
   };
 
 //==================================================================
 //  11. ORCHESTRATION
 //==================================================================
 void  SelfTest(const int mode);           // prototype: body follows the classes
+void  NoteGate(const string why);
 void  TryEntry(const int dir, double intendedVolume, const bool ignite);
 void  MakeDecision();
 void  UpdateDashboard();
+
+//---------------------------------------------------------------
+//  GATE REASON SURFACE
+//  activation: every blocked entry attempt
+//  mechanism : the reason is stored for the chart overlay and logged at
+//              most once per 30s (a silent "no trade" is indistinguishable
+//              from a broken install, so it is never silent)
+//  metric    : last block reason, printed with the full gate snapshot
+//---------------------------------------------------------------
+void NoteGate(const string why)
+  {
+   g_lastGateReason = why;
+   static datetime lastGateLog = 0;
+   datetime nowT = TimeCurrent();
+   if(lastGateLog != 0 && (int)(nowT - lastGateLog) < 30) return;
+   lastGateLog = nowT;
+   PrintFormat("ENTRY blocked: %s | edge=%.1f (min %.1f) mode=%s score=%.1f dir=%+d book=%d spread=%.1fpts pegs=%d hedged=%d",
+               why, g_scan.Edge(), InpMinEdgeToTrade, g_bal.ModeName(), g_bal.Score(),
+               g_scan.Dir(), (int)g_scan.BookUsable(), g_safe.SpreadPoints(),
+               g_exec.PegsResting(), (int)g_hedge.Active());
+  }
 
 //---------------------------------------------------------------
 //  ENTRY DECISION
@@ -2413,28 +2449,47 @@ void TryEntry(const int dir, double intendedVolume, const bool ignite)
       return;
      }
    double passiveRatio = g_bal.PassiveRatio();
-   double pegVol = NormalizeDouble(T*passiveRatio, VolumeDigits());
-   double iocVol = NormalizeDouble(T - pegVol, VolumeDigits());
+   //--- both sleeves go through NormVolume(): VOLUME_STEP aligned and
+   //    REJECTED (never bumped) when below SYMBOL_VOLUME_MIN
+   bool okP=false, okI=false;
+   double pegVol = (passiveRatio > 0.0) ? NormVolume(T*passiveRatio, okP) : 0.0;
+   if(!okP) pegVol = 0.0;                          // sub-minimum passive slice: dropped, not bumped
+   double iocVol = NormVolume(NormalizeDouble(T - pegVol, VolumeDigits()), okI);
+   if(!okI)
+     {
+      //--- the aggressive remainder would be sub-minimum: drop the passive
+      //    sleeve instead of leaving a batch that can only rest passively
+      //    (the engine must be able to take liquidity, not only quote it)
+      pegVol = 0.0;
+      iocVol = T;
+     }
 
    int sent = 0;
    if(pegVol >= g_volMin - 1.0e-9)
      {
       if(g_exec.PlacePassivePeg(dir, pegVol, false)) sent++;
-      else iocVol = T;                       // peg refused -> keep size passive-free
+      else iocVol = T;                                     // peg refused -> all aggressive
      }
-   if(iocVol >= g_volMin - 1.0e-9 && g_bal.Mode() != AGGR_DEFENSIVE)
+   //--- StartupIgnite is the anti-idle bootstrap: it snipes with a real
+   //    market order even in DEFENSIVE mode (it is a one-time 0.1..0.3x
+   //    batch and it is what makes the EA act on the first qualifying tick)
+   if(iocVol >= g_volMin - 1.0e-9 && (ignite || g_bal.Mode() != AGGR_DEFENSIVE))
       sent += g_exec.FireIOC(dir, iocVol, false);
 
    if(sent > 0)
      {
       g_lastDecision = TimeCurrent();
+      g_lastGateReason = "none - entry sent";
       if(ignite) g_bal.ConsumeIgnite();
       PrintFormat("ENTRY: dir=%+d T=%.2f peg=%.2f ioc=%.2f passive=%.0f%% mode=%s score=%.1f ignite=%d sent=%d",
                   dir, T, pegVol, iocVol, passiveRatio*100.0, g_bal.ModeName(),
                   g_bal.Score(), (int)ignite, sent);
      }
-   else if(InpVerboseLog)
-      PrintFormat("ENTRY: no micro-order accepted (dir=%+d T=%.2f) - gates or volume grid refused", dir, T);
+   else
+     {
+      g_lastGateReason = "micro-order refused by broker volume grid / peg cap";
+      PrintFormat("ENTRY: no micro-order accepted (dir=%+d T=%.2f) - volume grid or peg cap refused", dir, T);
+     }
   }
 
 //---------------------------------------------------------------
@@ -2456,7 +2511,7 @@ void MakeDecision()
          if(g_telem.Throttled()) vol *= ClampD((double)InpThrottleFactorPct,0.0,100.0)/100.0;
          if(!g_safe.VolumeRoomOK(vol, why))
            {
-            if(InpVerboseLog) Print("IGNITE blocked: ", why);
+            NoteGate("IGNITE blocked: "+why);
             return;
            }
          PrintFormat("IGNITE: bootstrap micro-batch dir=%+d vol=%.2f (%.0f%% of target) score=%.1f",
@@ -2464,12 +2519,25 @@ void MakeDecision()
          TryEntry(dir, vol, true);
          return;
         }
-      if(InpVerboseLog) Print("IGNITE deferred: ", why);
+      NoteGate("IGNITE deferred: "+why);
      }
 
-   if(g_bal.Mode() == AGGR_DEFENSIVE) return;               // no new entries
-   if(edge < 55.0)                    return;               // insufficient microstructure edge
-   if(dir == 0)                       return;
+   //--- every block is explained (overlay + throttled log)
+   if(g_bal.Mode() == AGGR_DEFENSIVE)
+     {
+      NoteGate(StringFormat("score %.1f < 40 -> DEFENSIVE (no new entries by contract)", g_bal.Score()));
+      return;
+     }
+   if(edge < InpMinEdgeToTrade)                             // permissive, tunable gate
+     {
+      NoteGate(StringFormat("edge %.1f < %.1f (InpMinEdgeToTrade)", edge, InpMinEdgeToTrade));
+      return;
+     }
+   if(dir == 0)
+     {
+      NoteGate("no directional signal yet (tick rule / DOM neutral)");
+      return;
+     }
 
    int minGap = MathMax(InpMinSecBetweenBatches, 1);
    if(g_lastDecision != 0 && (int)(TimeCurrent() - g_lastDecision) < minGap) return;
@@ -2477,20 +2545,15 @@ void MakeDecision()
    string why2="";
    if(!g_safe.AllowNewEntry(why2))
      {
-      static datetime lastGateLog = 0;
-      datetime nowT = TimeCurrent();
-      if(lastGateLog == 0 || (int)(nowT - lastGateLog) >= 30)
-        {
-         lastGateLog = nowT;
-         if(InpVerboseLog) Print("ENTRY blocked: ", why2);
-        }
+      NoteGate(why2);
       return;
      }
    double vol = InpTargetVolume*g_bal.VolumeScale();       // aggression clamp
+   if(vol < g_volMin) vol = g_volMin;                      // never shrink below one legal lot
    if(g_telem.Throttled()) vol *= ClampD((double)InpThrottleFactorPct,0.0,100.0)/100.0;
    if(!g_safe.VolumeRoomOK(vol, why2))
      {
-      if(InpVerboseLog) Print("ENTRY blocked: ", why2);
+      NoteGate(why2);
       return;
      }
    TryEntry(dir, vol, false);
@@ -2520,12 +2583,18 @@ void UpdateDashboard()
    txt += StringFormat("exec: avg=%.0fms p95=%.0fms pegs=%d sent=%I64u | %s\n",
                        g_telem.AvgLatency(), g_telem.P95Latency(), g_exec.PegsResting(),
                        g_telem.SentOrders(), g_telem.SummaryLine());
-   txt += StringFormat("safe: spread=%.1fpts marginHealth=%.2f dayVol=%.2f/%.2f rollover=%d winRate=%.2f (%d deals, last %s)\n",
-                       g_safe.SpreadPoints(), g_safe.MarginHealth(), g_dayVolume, InpMaxDailyVolume,
+   txt += StringFormat("safe: spread=%.1fpts marginFree=%.2f marginHealth=%.2f dayVol=%.2f/%.2f rollover=%d winRate=%.2f (%d deals, last %s)\n",
+                       g_safe.SpreadPoints(), g_safe.MarginFreePct(), g_safe.MarginHealth(),
+                       g_dayVolume, InpMaxDailyVolume,
                        (int)g_safe.InRollover(), g_telem.SessionWinRate(), g_telem.DealSamples(),
                        g_telem.LastDealTime() > 0.0
                           ? TimeToString((datetime)(long)g_telem.LastDealTime(), TIME_DATE|TIME_MINUTES)
                           : "n/a");
+   string gateWhy="";
+   bool   gateOpen = g_safe.AllowNewEntry(gateWhy);      // pure probe: reads state, no side effect
+   txt += StringFormat("gate: %s | decisionBlock=%s\n",
+                       gateOpen ? "OPEN - safety gates clear" : ("BLOCKED: "+gateWhy),
+                       g_lastGateReason);
    Comment(txt);
   }
 
