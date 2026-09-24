@@ -122,6 +122,12 @@ input int              InpMaxComplianceStrikes  = 3;       // Strikes before har
 input bool             InpShutdownOnFlag        = true;    // Hard shutdown (cancel all + stop) on strikes
 input int              InpThrottleFactorPct     = 50;      // Throttle: keep this % of target volume
 
+input group "8 -- Risk protection (0 = disabled; XAUUSD 1 point = 0.01 price)"
+input double           InpStopLossPoints        = 0.0;     // SL distance from entry (points) attached per order
+input double           InpTakeProfitPoints      = 0.0;     // TP distance from entry (points) attached per order
+input double           InpMaxMarginUsePct       = 20.0;    // Max position margin as % of equity (capacity brake)
+input double           InpMaxRiskPerEntryPct    = 0.0;     // Max equity risk per entry vs the SL (needs SL > 0)
+
 //==================================================================
 //  1. ENUMS / SMALL STRUCTS
 //==================================================================
@@ -185,6 +191,9 @@ double   g_volMax        = 100.0;
 double   g_volStep       = 0.01;
 long     g_stopsLevel    = 0;
 long     g_freezeLevel   = 0;
+double   g_slPoints      = 0.0;    // validated copy of InpStopLossPoints (0 = no stop attached)
+double   g_tpPoints      = 0.0;    // validated copy of InpTakeProfitPoints
+double   g_contractSize  = 100.0;  // SYMBOL_TRADE_CONTRACT_SIZE (XAUUSD: 100 oz per 1.00 lot)
 uint     g_fillFlags     = 0;
 ENUM_ORDER_TYPE_FILLING g_fillPolicy = ORDER_FILLING_IOC;
 int      g_hATR_H1       = INVALID_HANDLE;
@@ -1220,6 +1229,19 @@ public:
       req.type_time    = ORDER_TIME_GTC;
       req.magic        = hedge ? InpMagicHedge : InpMagicMain;
       req.comment      = hedge ? "HFT-H" : "HFT-M";
+      //--- protective levels are attached only to the main sleeve: the hedge
+      //    sleeve owns its catastrophe stop (TRADE_ACTION_SLTP) and must not
+      //    be closed early by an entry-distance stop.
+      if(!hedge && g_slPoints > 0.0)
+        {
+         double sl = NormPrice((dir > 0) ? px - g_slPoints*g_point : px + g_slPoints*g_point);
+         if(sl > 0.0) req.sl = sl;
+        }
+      if(!hedge && g_tpPoints > 0.0)
+        {
+         double tp = NormPrice((dir > 0) ? px + g_tpPoints*g_point : px - g_tpPoints*g_point);
+         if(tp > 0.0) req.tp = tp;
+        }
 
       return(SendAsync(req, res, v, hedge, false));
      }
@@ -1301,6 +1323,17 @@ public:
       req.type_time    = ORDER_TIME_GTC;
       req.magic        = hedge ? InpMagicHedge : InpMagicMain;
       req.comment      = hedge ? "HFT-HP" : "HFT-P";
+      //--- a resting limit is a real order: it carries the same protection
+      if(!hedge && g_slPoints > 0.0)
+        {
+         double sl = NormPrice((dir > 0) ? price - g_slPoints*g_point : price + g_slPoints*g_point);
+         if(sl > 0.0) req.sl = sl;
+        }
+      if(!hedge && g_tpPoints > 0.0)
+        {
+         double tp = NormPrice((dir > 0) ? price + g_tpPoints*g_point : price - g_tpPoints*g_point);
+         if(tp > 0.0) req.tp = tp;
+        }
       if(!SendAsync(req, res, v, hedge, true)) return(false);
 
       m_pegs[slot].ticket           = 1;             // provisional until ORDER_ADD
@@ -1872,6 +1905,79 @@ public:
          return(true);
         }
       return(false);
+     }
+
+   //---------------------------------------------------------------
+   //  CAPACITY BRAKE (money, not lots)
+   //  activation: every entry attempt
+   //  mechanism : the margin the broker would reserve for this order is
+   //              computed with OrderCalcMargin() and must fit under
+   //              InpMaxMarginUsePct of equity. Lots are a poor proxy for
+   //              risk when leverage and price move.
+   //  metric    : used margin vs cap (also shown on the chart)
+   //---------------------------------------------------------------
+   bool              MarginCapacityOK(const double volume, const int dir, string &why)
+     {
+      why = "";
+      if(InpMaxMarginUsePct <= 0.0) return(true);            // brake disabled by the user
+      double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(eq <= 0.0) { why = "no equity"; return(false); }
+      MqlTick tk;
+      if(!SymbolInfoTick(_Symbol, tk)) return(true);          // no quote: never invent a refusal
+      double px = (dir > 0) ? tk.ask : tk.bid;
+      if(px <= 0.0) return(true);
+      double need = 0.0;
+      ENUM_ORDER_TYPE ot = (dir > 0) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      if(!OrderCalcMargin(ot, _Symbol, volume, px, need)) return(true);
+      if(!IsFiniteD(need) || need <= 0.0) return(true);
+      double used = AccountInfoDouble(ACCOUNT_MARGIN);
+      double cap  = InpMaxMarginUsePct/100.0*eq;
+      if(used + need > cap + 1.0e-9)
+        {
+         why = StringFormat("margin capacity: used %.2f + needed %.2f > cap %.2f (%.0f%% of equity %.2f)",
+                            used, need, cap, InpMaxMarginUsePct, eq);
+         return(false);
+        }
+      return(true);
+     }
+
+   //---------------------------------------------------------------
+   //  RISK BUDGET (opt-in, needs InpStopLossPoints > 0)
+   //  activation: every entry attempt with a stop attached
+   //  mechanism : budget = InpMaxRiskPerEntryPct% of equity; lots that the
+   //              stop distance can carry = budget / lossPerLot(SL), where
+   //              lossPerLot comes from OrderCalcProfit() (broker exact)
+   //              with the tick-value / contract-size formulas as fallbacks
+   //  metric    : volume that is never bigger than the risk budget allows;
+   //              a budget that cannot carry one legal lot REFUSES the entry
+   //              (reject, never bump - the volume is never rounded up)
+   //---------------------------------------------------------------
+   double            RiskCappedVolume(const double intended, const int dir,
+                                      const double refPrice, string &why)
+     {
+      why = "";
+      if(InpMaxRiskPerEntryPct <= 0.0 || g_slPoints <= 0.0) return(intended);  // disabled
+      double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(eq <= 0.0 || refPrice <= 0.0) return(intended);
+      double budget = InpMaxRiskPerEntryPct/100.0*eq;
+      double slDist = g_slPoints*g_point;
+      double slPrice = (dir > 0) ? refPrice - slDist : refPrice + slDist;
+      if(slPrice <= 0.0 || slDist <= 0.0) return(intended);
+      ENUM_ORDER_TYPE ot = (dir > 0) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      double lossPerLot = 0.0, p = 0.0;
+      if(OrderCalcProfit(ot, _Symbol, 1.0, refPrice, slPrice, p) && p < 0.0) lossPerLot = -p;
+      if(lossPerLot <= 1.0e-9 && g_contractSize > 0.0) lossPerLot = slDist*g_contractSize;
+      if(lossPerLot <= 1.0e-9) return(intended);              // cannot price it: do not block
+      double raw = budget/lossPerLot;
+      bool ok = false;
+      double v = NormVolume(raw, ok);
+      if(!ok || v <= 0.0)
+        {
+         why = StringFormat("risk budget %.2f USD cannot carry one legal lot (raw %.5f lots at SL %.0f pts) - rejected, not bumped",
+                            budget, raw, g_slPoints);
+         return(0.0);
+        }
+      return(MathMin(intended, v));
      }
 
    bool              VolumeRoomOK(const double intended, string &why)
@@ -2448,6 +2554,21 @@ void TryEntry(const int dir, double intendedVolume, const bool ignite)
                   intendedVolume, g_volMin, g_volStep);
       return;
      }
+   //--- money-level brakes: risk budget (needs a stop) and margin capacity.
+   //    Both can only SHRINK or REFUSE the entry, never enlarge it.
+   MqlTick tkRef;
+   double refPx = 0.0;
+   if(SymbolInfoTick(_Symbol, tkRef)) refPx = (dir > 0) ? tkRef.ask : tkRef.bid;
+   if(refPx > 0.0)
+     {
+      string whyR = "";
+      double capped = g_safe.RiskCappedVolume(T, dir, refPx, whyR);
+      if(capped <= 0.0) { NoteGate(whyR); return; }
+      T = capped;
+     }
+   string whyM = "";
+   if(!g_safe.MarginCapacityOK(T, dir, whyM)) { NoteGate(whyM); return; }
+
    double passiveRatio = g_bal.PassiveRatio();
    //--- both sleeves go through NormVolume(): VOLUME_STEP aligned and
    //    REJECTED (never bumped) when below SYMBOL_VOLUME_MIN
@@ -2590,6 +2711,12 @@ void UpdateDashboard()
                        g_telem.LastDealTime() > 0.0
                           ? TimeToString((datetime)(long)g_telem.LastDealTime(), TIME_DATE|TIME_MINUTES)
                           : "n/a");
+   double eqD = AccountInfoDouble(ACCOUNT_EQUITY);
+   double mgD = AccountInfoDouble(ACCOUNT_MARGIN);
+   txt += StringFormat("risk: SL=%s TP=%s | margin used %.1f%% of the %.0f%% cap | 1 lot XAUUSD = %.0f oz\n",
+                       g_slPoints > 0.0 ? (DoubleToString(g_slPoints,0)+" pts") : "OFF (unbounded)",
+                       g_tpPoints > 0.0 ? (DoubleToString(g_tpPoints,0)+" pts") : "OFF",
+                       (eqD > 0.0) ? (mgD/eqD*100.0) : 0.0, InpMaxMarginUsePct, g_contractSize);
    string gateWhy="";
    bool   gateOpen = g_safe.AllowNewEntry(gateWhy);      // pure probe: reads state, no side effect
    txt += StringFormat("gate: %s | decisionBlock=%s\n",
@@ -2713,6 +2840,8 @@ int OnInit()
    g_volStep     = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    g_stopsLevel  = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
    g_freezeLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   g_contractSize= SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+   if(g_contractSize <= 0.0) g_contractSize = 100.0;        // XAUUSD: 100 oz per 1.00 lot
    g_fillFlags   = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
 
    if(g_digits <= 0)    g_digits  = 2;
@@ -2776,6 +2905,24 @@ int OnInit()
       return(INIT_PARAMETERS_INCORRECT);
      }
 
+   //--- protective levels: a stop that the symbol cannot accept is reported
+   //    and disabled instead of being sent and rejected by the server
+   g_slPoints = InpStopLossPoints;
+   g_tpPoints = InpTakeProfitPoints;
+   double minStopPts = (double)g_stopsLevel + 1.0;
+   if(g_slPoints > 0.0 && g_slPoints < minStopPts)
+     {
+      PrintFormat("INIT WARNING: InpStopLossPoints %.0f < stops level %d -> SL disabled (use >= %.0f points, or 0)",
+                  g_slPoints, (int)g_stopsLevel, minStopPts);
+      g_slPoints = 0.0;
+     }
+   if(g_tpPoints > 0.0 && g_tpPoints < minStopPts)
+     {
+      PrintFormat("INIT WARNING: InpTakeProfitPoints %.0f < stops level %d -> TP disabled (use >= %.0f points, or 0)",
+                  g_tpPoints, (int)g_stopsLevel, minStopPts);
+      g_tpPoints = 0.0;
+     }
+
    //--- wiring, ATR handles, telemetry, DOM subscription
    g_exec.Init(g_telem);
    g_telem.OpenLog(InpCSVFileName);
@@ -2809,6 +2956,20 @@ int OnInit()
                (int)ClampD((double)InpMicroBullets,3.0,9.0), InpTargetVolume, InpMaxTotalLots,
                InpMaxDailyVolume, (int)InpLatencyThresholdMs, InpMaxCancellationRate,
                (int)InpMaxOwnLayersPerSide, InpCriticalMarginLevel);
+   //--- HONEST RISK LABEL: on XAUUSD 1.00 lot = g_contractSize ounces, so a
+   //    0.01 lot position moves g_contractSize*0.01*0.01 = 0.01*contract USD
+   //    per point. The engine is TOLD how much money one point costs, so the
+   //    stop distance and the position size can be chosen for the account.
+   if(g_slPoints > 0.0)
+      PrintFormat("INIT RISK LABEL: SL=%.0f points (%.2f USD price distance). 0.01 lot XAUUSD loses ~%.2f USD at that stop; 1.00 lot loses ~%.2f USD.",
+                  g_slPoints, g_slPoints*g_point, g_slPoints*g_point*g_contractSize*0.01,
+                  g_slPoints*g_point*g_contractSize);
+   else
+      PrintFormat("INIT RISK WARNING: no stop loss attached (InpStopLossPoints=0). Losses are bounded only by InpMaxTotalLots=%.2f, InpMaxMarginUsePct=%.0f%% and the hedge. 1.00 lot XAUUSD loses ~%.2f USD per 1.00 price move.",
+                  InpMaxTotalLots, InpMaxMarginUsePct, g_contractSize);
+   PrintFormat("INIT CAPACITY BRAKE: new entries stop when used margin would exceed %.0f%% of equity; the broker reports %.2f USD initial margin per 1.00 lot (%.2f USD per 0.01 lot).",
+               InpMaxMarginUsePct, SymbolInfoDouble(_Symbol,SYMBOL_MARGIN_INITIAL),
+               SymbolInfoDouble(_Symbol,SYMBOL_MARGIN_INITIAL)*0.01);
    if(MQLInfoInteger(MQL_TESTER))
      {
       Print("INIT NOTE: inside the Strategy Tester OrderSendAsync behaves like OrderSend,");
