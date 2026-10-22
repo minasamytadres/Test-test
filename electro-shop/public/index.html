@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>نظام إدارة المتجر — مستلزمات كهرباء</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="login-screen" class="login-screen hidden">
+  <div class="login-box">
+    <h1>نظام إدارة المتجر</h1>
+    <p class="muted">مستلزمات كهرباء — مصر</p>
+    <form id="login-form">
+      <label>اسم المستخدم</label>
+      <input id="login-username" autocomplete="username" required>
+      <label>كلمة المرور</label>
+      <input id="login-password" type="password" autocomplete="current-password" required>
+      <button type="submit" class="btn primary">تسجيل الدخول</button>
+      <p id="login-error" class="error"></p>
+    </form>
+  </div>
+</div>
+
+<div id="app" class="app hidden">
+  <aside class="sidebar">
+    <div class="brand">
+      <h2 id="shop-name">المتجر</h2>
+      <span id="who" class="muted"></span>
+    </div>
+    <nav id="nav">
+      <a href="#dashboard" data-sec="dashboard" data-perm="">لوحة التحكم</a>
+      <a href="#pos" data-sec="pos" data-perm="sales.create">نقطة البيع</a>
+      <a href="#products" data-sec="products" data-perm="">الأصناف</a>
+      <a href="#inventory" data-sec="inventory" data-perm="">المخزون</a>
+      <a href="#sales" data-sec="sales" data-perm="">المبيعات</a>
+      <a href="#purchases" data-sec="purchases" data-perm="purchases.create">المشتريات</a>
+      <a href="#returns" data-sec="returns" data-perm="returns.create">المرتجعات</a>
+      <a href="#customers" data-sec="customers" data-perm="">العملاء</a>
+      <a href="#suppliers" data-sec="suppliers" data-perm="suppliers.write">الموردون</a>
+      <a href="#cashbox" data-sec="cashbox" data-perm="">الصندوق</a>
+      <a href="#reports" data-sec="reports" data-perm="reports.view">التقارير</a>
+      <a href="#users" data-sec="users" data-perm="users.manage">المستخدمون</a>
+      <a href="#backup" data-sec="backup" data-perm="backup.manage">النسخ الاحتياطي</a>
+      <a href="#settings" data-sec="settings" data-perm="settings.write">الإعدادات</a>
+      <a href="#audit" data-sec="audit" data-perm="audit.view">سجل التدقيق</a>
+    </nav>
+    <button id="logout-btn" class="btn danger-outline">تسجيل الخروج</button>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <h1 id="section-title">لوحة التحكم</h1>
+      <span id="clock" class="muted"></span>
+    </header>
+    <section id="view"></section>
+  </main>
+</div>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3 id="modal-title"></h3>
+      <button id="modal-close" class="icon-btn">×</button>
+    </div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
