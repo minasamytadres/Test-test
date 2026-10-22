@@ -1,0 +1,21 @@
+{
+  "name": "electro-shop",
+  "version": "1.0.0",
+  "description": "نظام إدارة متجر مستلزمات كهرباء — نقطة بيع ومخزون وحسابات (عربي، جنيه مصري)",
+  "main": "server/server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server/server.js",
+    "start:sample": "node server/server.js --sample",
+    "test": "node test/business.test.js",
+    "test:sqlite": "node test/sqlite.test.js",
+    "test:all": "npm run test && npm run test:sqlite"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "express": "^4.19.2"
+  }
+}
