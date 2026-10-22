@@ -177,13 +177,20 @@ app.get('/api/settings', requireAuth, function (req, res) {
   res.json(out);
 });
 
+const ALLOWED_SETTINGS = {
+  shop_name: 1, currency: 1, default_tax_pct: 1, max_discount_pct: 1,
+  credit_limit_default: 1, allow_below_cost: 1, address: 1, phone: 1, receipt_footer: 1
+};
+
 app.put('/api/settings', requireAuth, requirePerm('settings.write'), function (req, res) {
-  const banned = { session_secret: 1 };
+  const applied = {};
   Object.keys(req.body || {}).forEach(function (k) {
-    if (banned[k]) return;
-    store.setSetting(k, req.body[k]);
+    if (ALLOWED_SETTINGS[k]) {
+      store.setSetting(k, req.body[k]);
+      applied[k] = req.body[k];
+    }
   });
-  audit(req, 'settings.update', 'settings', null, req.body);
+  audit(req, 'settings.update', 'settings', null, applied);
   res.json({ ok: true });
 });
 
@@ -226,14 +233,21 @@ app.put('/api/products/:id', requireAuth, requirePerm('products.write'), functio
   const p = store.db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
   if (!p) return res.status(404).json({ error: 'الصنف غير موجود' });
   try {
+    const newCost = E.roundMoney(num(b.cost_price, p.cost_price));
+    const newSale = E.roundMoney(num(b.sale_price, p.sale_price));
     store.db.prepare(
       'UPDATE products SET name = ?, category_id = ?, unit = ?, barcode = ?, cost_price = ?, ' +
       'sale_price = ?, tax_pct = ?, reorder_level = ?, is_active = ?, updated_at = ? WHERE id = ?')
       .run(b.name || p.name, b.category_id != null ? b.category_id : p.category_id,
            b.unit || p.unit, b.barcode != null ? b.barcode : p.barcode,
-           E.roundMoney(num(b.cost_price, p.cost_price)), E.roundMoney(num(b.sale_price, p.sale_price)),
+           newCost, newSale,
            num(b.tax_pct, p.tax_pct), num(b.reorder_level, p.reorder_level),
            b.is_active != null ? (b.is_active ? 1 : 0) : p.is_active, DB.nowISO(), p.id);
+    if (newCost !== E.roundMoney(p.cost_price) || newSale !== E.roundMoney(p.sale_price)) {
+      store.db.prepare(
+        'INSERT INTO price_history (product_id, old_cost, old_sale, new_cost, new_sale, user_id, created_at) VALUES (?,?,?,?,?,?,?)')
+        .run(p.id, p.cost_price, p.sale_price, newCost, newSale, req.user.id, DB.nowISO());
+    }
     audit(req, 'product.update', 'product', p.id, b);
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ error: e.message }); }
@@ -311,7 +325,6 @@ app.post('/api/sales', requireAuth, requirePerm('sales.create'), function (req, 
       return { productId: p.id, name: p.name, qty: it.qty, unitPrice: it.unitPrice,
                discountPct: it.discountPct, costPrice: p.avg_cost, taxPct: p.tax_pct, product: p };
     });
-    const taxTotal = enriched.reduce(function (s, it) { return s + it.net * it.taxPct / 100; }, 0);
     const totals = E.validateSale({
       items: enriched,
       invoiceDiscountPct: num(b.invoiceDiscountPct),
@@ -322,6 +335,18 @@ app.post('/api/sales', requireAuth, requirePerm('sales.create'), function (req, 
       hasDiscountPerm: E.roleCan(req.user.role, 'sales.discount')
     });
 
+    /* ضريبة لكل بند بعد خصم البند + الحصة التناسبية من خصم الفاتورة */
+    const afterLines = E.roundMoney(totals.subtotal - totals.lineDiscounts);
+    let taxTotal = 0;
+    totals.lines.forEach(function (line, i) {
+      const it = enriched[i];
+      const share = afterLines > 0 ? E.roundMoney(line.net / afterLines * totals.invoiceDiscount) : 0;
+      const netAfterInv = E.roundMoney(line.net - share);
+      taxTotal += netAfterInv * (Number(it.taxPct) || 0) / 100;
+    });
+    taxTotal = E.roundMoney(taxTotal);
+    const grandTotal = E.roundMoney(totals.total + taxTotal);
+
     let customer = null;
     if (b.customerId) {
       customer = store.db.prepare('SELECT * FROM customers WHERE id = ?').get(b.customerId);
@@ -330,10 +355,13 @@ app.post('/api/sales', requireAuth, requirePerm('sales.create'), function (req, 
     const paymentType = b.paymentType === 'credit' ? 'credit' : 'cash';
     if (paymentType === 'credit') {
       if (!customer) throw new E.EngineError('E_CREDIT_NO_CUSTOMER', 'البيع الآجل يتطلب اختيار عميل');
-      E.canExtendCredit(customer.balance, customer.credit_limit, totals.total);
+      if (E.canExtendCredit(customer.balance, customer.credit_limit, grandTotal) !== true) {
+        throw new E.EngineError('E_CREDIT_LIMIT',
+          'حد الائتمان صفري أو غير محدد — البيع الآجل غير مسموح لهذا العميل');
+      }
     }
-    const paid = paymentType === 'cash' ? E.roundMoney(num(b.paid, totals.total)) : 0;
-    if (paymentType === 'cash' && paid < totals.total) {
+    const paid = paymentType === 'cash' ? E.roundMoney(num(b.paid, grandTotal)) : 0;
+    if (paymentType === 'cash' && paid < grandTotal) {
       throw new E.EngineError('E_PAID_SHORT', 'المدفوع أقل من إجمالي الفاتورة');
     }
 
@@ -351,8 +379,8 @@ app.post('/api/sales', requireAuth, requirePerm('sales.create'), function (req, 
         'invoice_discount, net, tax_pct, tax, total, cost_total, payment_type, paid, status, notes, created_at) ' +
         'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
         .run(number, customer ? customer.id : null, req.user.id, totals.subtotal, totals.lineDiscounts,
-             totals.invoiceDiscountPct, totals.invoiceDiscount, totals.net, 0, E.roundMoney(taxTotal),
-             totals.total, E.roundMoney(costTotal), paymentType, paid, 'completed', b.notes || null, DB.nowISO());
+             totals.invoiceDiscountPct, totals.invoiceDiscount, totals.net, 0, taxTotal,
+             grandTotal, E.roundMoney(costTotal), paymentType, paid, 'completed', b.notes || null, DB.nowISO());
       const saleId = info.lastInsertRowid;
       enriched.forEach(function (it, i) {
         const line = totals.lines[i];
@@ -366,30 +394,41 @@ app.post('/api/sales', requireAuth, requirePerm('sales.create'), function (req, 
           .run(it.productId, it.qty, it.product.avg_cost, saleId, req.user.id, DB.nowISO());
       });
       if (paymentType === 'cash') {
-        const eff = E.cashEffect('sale', totals.total);
+        const eff = E.cashEffect('sale', grandTotal);
         store.db.prepare(
           'INSERT INTO cashbox_tx (type, amount, ref_type, ref_id, note, user_id, created_at) VALUES (?,?,?,?,?,?,?)')
           .run(eff.type, eff.amount, 'sale', saleId, 'تحصيل فاتورة ' + number, req.user.id, DB.nowISO());
         store.db.prepare(
           "INSERT INTO journal (account, debit, credit, ref_type, ref_id, note, created_at) VALUES ('cash', ?, 0, 'sale', ?, ?, ?)")
-          .run(totals.total, saleId, number, DB.nowISO());
+          .run(grandTotal, saleId, number, DB.nowISO());
         store.db.prepare(
           "INSERT INTO journal (account, debit, credit, ref_type, ref_id, note, created_at) VALUES ('sales', 0, ?, 'sale', ?, ?, ?)")
           .run(totals.net, saleId, number, DB.nowISO());
+        if (taxTotal > 0) {
+          store.db.prepare(
+            "INSERT INTO journal (account, debit, credit, ref_type, ref_id, note, created_at) VALUES ('tax', 0, ?, 'sale', ?, ?, ?)")
+            .run(taxTotal, saleId, number, DB.nowISO());
+        }
       } else {
         store.db.prepare('UPDATE customers SET balance = balance + ?, updated_at = ? WHERE id = ?')
-          .run(totals.total, DB.nowISO(), customer.id);
+          .run(grandTotal, DB.nowISO(), customer.id);
         store.db.prepare(
           "INSERT INTO journal (account, debit, credit, ref_type, ref_id, note, created_at) VALUES (?, ?, 0, 'sale', ?, ?, ?)")
-          .run('receivable:' + customer.id, totals.total, saleId, number, DB.nowISO());
+          .run('receivable:' + customer.id, grandTotal, saleId, number, DB.nowISO());
         store.db.prepare(
           "INSERT INTO journal (account, debit, credit, ref_type, ref_id, note, created_at) VALUES ('sales', 0, ?, 'sale', ?, ?, ?)")
           .run(totals.net, saleId, number, DB.nowISO());
+        if (taxTotal > 0) {
+          store.db.prepare(
+            "INSERT INTO journal (account, debit, credit, ref_type, ref_id, note, created_at) VALUES ('tax', 0, ?, 'sale', ?, ?, ?)")
+            .run(taxTotal, saleId, number, DB.nowISO());
+        }
       }
-      return { id: saleId, number: number, totals: totals, change: paymentType === 'cash' ? E.cashChange(totals.total, paid) : 0 };
+      return { id: saleId, number: number, totals: totals, grandTotal: grandTotal,
+               change: paymentType === 'cash' ? E.cashChange(grandTotal, paid) : 0 };
     });
     const result = tx();
-    audit(req, 'sale.create', 'sale', result.id, { number: result.number, total: result.totals.total });
+    audit(req, 'sale.create', 'sale', result.id, { number: result.number, total: result.grandTotal });
     res.json(result);
   } catch (e) {
     res.status(400).json({ error: e.message, code: e.code });
@@ -438,7 +477,7 @@ app.post('/api/sale-returns', requireAuth, requirePerm('returns.create'), functi
     });
     total = E.roundMoney(total);
     const number = store.nextNumber('SR');
-    const refundType = b.refundType === 'credit' ? 'credit' : 'cash';
+    const refundType = (b.refundType === 'credit' && sale.customer_id) ? 'credit' : 'cash';
     const tx = store.db.transaction(function () {
       const info = store.db.prepare(
         'INSERT INTO sale_returns (number, sale_id, customer_id, user_id, total, refund_type, reason, created_at) ' +
@@ -458,7 +497,7 @@ app.post('/api/sale-returns', requireAuth, requirePerm('returns.create'), functi
         const eff = E.cashEffect('sale-return', total);
         store.db.prepare('INSERT INTO cashbox_tx (type, amount, ref_type, ref_id, note, user_id, created_at) VALUES (?,?,?,?,?,?,?)')
           .run(eff.type, eff.amount, 'sale-return', rid, 'رد قيمة مرتجع ' + number, req.user.id, DB.nowISO());
-      } else if (sale.customer_id) {
+      } else {
         store.db.prepare('UPDATE customers SET balance = balance - ?, updated_at = ? WHERE id = ?')
           .run(total, DB.nowISO(), sale.customer_id);
       }
@@ -522,6 +561,11 @@ app.post('/api/purchases', requireAuth, requirePerm('purchases.create'), functio
           .run(l.p.id, l.qty, l.unitCost, pid, req.user.id, DB.nowISO());
         store.db.prepare('UPDATE products SET avg_cost = ?, cost_price = ?, updated_at = ? WHERE id = ?')
           .run(newAvg, l.unitCost, DB.nowISO(), l.p.id);
+        if (E.roundMoney(newAvg) !== E.roundMoney(l.p.avg_cost) || E.roundMoney(l.unitCost) !== E.roundMoney(l.p.cost_price)) {
+          store.db.prepare(
+            'INSERT INTO price_history (product_id, old_cost, old_sale, new_cost, new_sale, user_id, created_at) VALUES (?,?,?,?,?,?,?)')
+            .run(l.p.id, l.p.avg_cost, l.p.sale_price, newAvg, l.p.sale_price, req.user.id, DB.nowISO());
+        }
       });
       if (paymentType === 'cash') {
         const eff = E.cashEffect('purchase', total);
@@ -573,10 +617,11 @@ app.post('/api/purchase-returns', requireAuth, requirePerm('purchases.create'), 
     });
     total = E.roundMoney(total);
     const number = store.nextNumber('PR');
+    const refundType = (b.refundType !== 'cash' && purch.supplier_id) ? 'credit' : 'cash';
     const tx = store.db.transaction(function () {
       const info = store.db.prepare(
         'INSERT INTO purchase_returns (number, purchase_id, supplier_id, user_id, total, refund_type, reason, created_at) VALUES (?,?,?,?,?,?,?,?)')
-        .run(number, purch.id, purch.supplier_id, req.user.id, total, b.refundType === 'cash' ? 'cash' : 'credit', b.reason || null, DB.nowISO());
+        .run(number, purch.id, purch.supplier_id, req.user.id, total, refundType, b.reason || null, DB.nowISO());
       const rid = info.lastInsertRowid;
       checked.forEach(function (c) {
         store.db.prepare('INSERT INTO purchase_return_items (return_id, purchase_item_id, product_id, qty, unit_cost, net) VALUES (?,?,?,?,?,?)')
@@ -587,10 +632,10 @@ app.post('/api/purchase-returns', requireAuth, requirePerm('purchases.create'), 
           "VALUES (?, 'out', ?, ?, 'purchase-return', ?, NULL, ?, ?)")
           .run(c.pi.product_id, c.qty, c.pi.unit_cost, rid, req.user.id, DB.nowISO());
       });
-      if (b.refundType === 'cash') {
+      if (refundType === 'cash') {
         store.db.prepare('INSERT INTO cashbox_tx (type, amount, ref_type, ref_id, note, user_id, created_at) VALUES (?,?,?,?,?,?,?)')
           .run('purchase-return', total, 'purchase-return', rid, 'تحصيل مرتجع شراء ' + number, req.user.id, DB.nowISO());
-      } else if (purch.supplier_id) {
+      } else {
         store.db.prepare('UPDATE suppliers SET balance = balance - ?, updated_at = ? WHERE id = ?')
           .run(total, DB.nowISO(), purch.supplier_id);
       }
@@ -702,6 +747,9 @@ app.post('/api/cashbox/tx', requireAuth, requirePerm('cashbox.manage'), function
   const b = req.body || {};
   try {
     const eff = E.cashEffect(b.type === 'withdraw' ? 'withdraw' : 'deposit', num(b.amount));
+    if (!(eff.amount > 0)) {
+      throw new E.EngineError('E_AMOUNT_INVALID', 'المبلغ يجب أن يكون رقمًا أكبر من صفر');
+    }
     store.db.prepare('INSERT INTO cashbox_tx (type, amount, ref_type, note, user_id, created_at) VALUES (?,?,?,?,?,?)')
       .run(eff.type, eff.amount, 'manual', b.note || null, req.user.id, DB.nowISO());
     audit(req, 'cashbox.tx', 'cashbox', null, { type: eff.type, amount: eff.amount });
@@ -713,6 +761,9 @@ app.post('/api/expenses', requireAuth, requirePerm('expenses.create'), function 
   const b = req.body || {};
   try {
     const eff = E.cashEffect('expense', num(b.amount));
+    if (!(eff.amount > 0)) {
+      throw new E.EngineError('E_AMOUNT_INVALID', 'المبلغ يجب أن يكون رقمًا أكبر من صفر');
+    }
     const tx = store.db.transaction(function () {
       const info = store.db.prepare('INSERT INTO expenses (category, amount, note, user_id, created_at) VALUES (?,?,?,?,?)')
         .run(String(b.category || 'مصروف'), eff.amount, b.note || null, req.user.id, DB.nowISO());
@@ -737,12 +788,14 @@ app.get('/api/dashboard', requireAuth, function (req, res) {
   const todayISO = dayStart.toISOString();
   const t = store.db.prepare('SELECT COALESCE(SUM(total),0) AS v FROM sales WHERE created_at >= ?').get(todayISO).v;
   const m = store.db.prepare("SELECT COALESCE(SUM(total),0) AS v FROM sales WHERE created_at >= datetime('now','start of month')").get().v;
-  const p = store.db.prepare("SELECT COALESCE(SUM(total - cost_total),0) AS v FROM sales WHERE created_at >= datetime('now','start of month')").get().v;
+  const p = store.db.prepare("SELECT COALESCE(SUM(total - tax - cost_total),0) AS v FROM sales WHERE created_at >= datetime('now','start of month')").get().v;
   const cash = E.cashBalanceAfter(store.db.prepare('SELECT type, amount FROM cashbox_tx').all());
-  const low = store.db.prepare(
-    'SELECT p.id, p.name, p.sku FROM products p WHERE p.is_active = 1').all()
-    .filter(function (p2) { return E.isLowStock(store.stockOf(p2.id), 0) || E.isLowStock(store.stockOf(p2.id), store.db.prepare('SELECT reorder_level FROM products WHERE id = ?').get(p2.id).reorder_level); })
-    .length;
+  const lowRows = store.db.prepare(
+    "SELECT p.reorder_level, COALESCE((SELECT SUM(CASE WHEN m.type = 'in' THEN m.qty ELSE -m.qty END) FROM stock_moves m WHERE m.product_id = p.id), 0) AS stock " +
+    'FROM products p WHERE p.is_active = 1').all();
+  const low = lowRows.filter(function (r) {
+    return E.isLowStock(r.stock, r.reorder_level) || r.stock <= 0;
+  }).length;
   const receivables = store.db.prepare('SELECT COALESCE(SUM(balance),0) AS v FROM customers').get().v;
   const payables = store.db.prepare('SELECT COALESCE(SUM(balance),0) AS v FROM suppliers').get().v;
   res.json({
@@ -754,7 +807,7 @@ app.get('/api/dashboard', requireAuth, function (req, res) {
 
 app.get('/api/reports/daily', requireAuth, requirePerm('reports.view'), function (req, res) {
   const rows = store.db.prepare(
-    "SELECT date(created_at) AS day, COUNT(*) AS invoices, SUM(total) AS total, SUM(total - cost_total) AS profit " +
+    "SELECT date(created_at) AS day, COUNT(*) AS invoices, SUM(total) AS total, SUM(total - tax - cost_total) AS profit " +
     'FROM sales GROUP BY day ORDER BY day DESC LIMIT 60').all();
   rows.forEach(function (r) { r.total = E.roundMoney(r.total); r.profit = E.roundMoney(r.profit); });
   sendRows(req, res, rows, 'daily-report.csv');
@@ -943,3 +996,4 @@ app.listen(PORT, HOST, function () {
 });
 
 module.exports = app;
+

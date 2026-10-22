@@ -192,6 +192,14 @@ function validateSale(input) {
   });
   const maxDisc = Number(input.maxDiscountPct) || 0;
   const allowBelowCost = !!input.allowBelowCost;
+  const invDisc = Number(input.invoiceDiscountPct) || 0;
+  if (input.requireDiscountPerm && invDisc > 0 && !input.hasDiscountPerm) {
+    throw new EngineError('E_DISCOUNT_PERM', 'خصم الفاتورة يتطلب صلاحية sales.discount');
+  }
+  if (maxDisc > 0 && invDisc > maxDisc) {
+    throw new EngineError('E_DISCOUNT_CAP',
+      'خصم الفاتورة يتجاوز الحد الأقصى المسموح (' + maxDisc + '%)');
+  }
   for (const it of items) {
     const d = Number(it.discountPct) || 0;
     if (input.requireDiscountPerm && d > 0 && !input.hasDiscountPerm) {
@@ -301,3 +309,4 @@ module.exports = {
   cashEffect: cashEffect, cashBalanceAfter: cashBalanceAfter,
   UNITS: UNITS, assertUnit: assertUnit
 };
+

@@ -4,7 +4,9 @@
  * ===================================================================== */
 
 const fmt = (v) => (Math.round((Number(v) || 0) * 100) / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' ج.م';
+const rm = (v) => Math.round(((Number(v) || 0) + Number.EPSILON) * 100000) / 100000;
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const jsq = (s) => esc(String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
 const dt = (s) => s ? String(s).replace('T', ' ').slice(0, 16) : '';
 const UNITS = { pcs: 'قطعة', box: 'علبة', meter: 'متر', roll: 'لفة', kg: 'كجم' };
 const ROLE_NAMES = { admin: 'مدير النظام', manager: 'مدير', cashier: 'كاشير', accountant: 'محاسب' };
@@ -152,6 +154,7 @@ async function vPOS() {
           <div><span>الإجمالي قبل الخصم</span><span id="t-gross">${fmt(0)}</span></div>
           <div><span>خصم الفاتورة %</span>
             <input id="inv-disc" style="width:70px" value="0" oninput="renderCart()"></div>
+          <div><span>الضريبة</span><span id="t-tax">${fmt(0)}</span></div>
           <div class="grand"><span>الإجمالي النهائي</span><span id="t-total">${fmt(0)}</span></div>
         </div>
         <div class="row" style="margin-top:12px">
@@ -192,7 +195,7 @@ function addToCart(id) {
   const line = cart.find((l) => l.productId === id);
   const q = line ? line.qty + 1 : 1;
   if (q > p.stock) return toast('الكمية المطلوبة تتجاوز المخزون المتاح', 'err');
-  if (line) line.qty = q; else cart.push({ productId: id, name: p.name, unitPrice: p.sale_price, qty: 1, discountPct: 0, stock: p.stock });
+  if (line) line.qty = q; else cart.push({ productId: id, name: p.name, unitPrice: p.sale_price, qty: 1, discountPct: 0, stock: p.stock, taxPct: Number(p.tax_pct) || 0 });
   renderCart();
 }
 
@@ -208,10 +211,30 @@ function cartDisc(i, v) {
   renderCart();
 }
 
-function renderCart() {
-  const gross = cart.reduce((s, l) => s + l.qty * l.unitPrice * (1 - l.discountPct / 100), 0);
+/* يحاكي حساب الخادم تمامًا (خصم بند + حصة تناسبية من خصم الفاتورة + ضريبة لكل بند) */
+function cartTotals() {
+  const lines = cart.map((l) => ({
+    gross: rm(l.qty * l.unitPrice),
+    net: rm(l.qty * l.unitPrice * (1 - l.discountPct / 100)),
+    taxPct: Number(l.taxPct) || 0 }));
+  let subtotal = 0, lineDiscounts = 0;
+  lines.forEach((l) => { subtotal += l.gross; lineDiscounts += (l.gross - l.net); });
+  subtotal = rm(subtotal);
+  const afterLines = rm(subtotal - lineDiscounts);
   const d = Math.max(0, Math.min(100, Number(document.getElementById('inv-disc').value) || 0));
-  const total = gross * (1 - d / 100);
+  const invDiscAmount = rm(afterLines * d / 100);
+  const net = rm(afterLines - invDiscAmount);
+  let tax = 0;
+  lines.forEach((l) => {
+    const share = afterLines > 0 ? rm(l.net / afterLines * invDiscAmount) : 0;
+    tax += rm(l.net - share) * l.taxPct / 100;
+  });
+  tax = rm(tax);
+  return { gross: subtotal, net: net, tax: tax, total: rm(net + tax) };
+}
+
+function renderCart() {
+  const t = cartTotals();
   document.getElementById('cart-items').innerHTML = cart.map((l, i) => `
     <div class="cart-line">
       <div>${esc(l.name)}<br><span class="muted">${fmt(l.unitPrice)} × ${l.qty}</span></div>
@@ -222,26 +245,25 @@ function renderCart() {
         <b>${fmt(l.qty * l.unitPrice * (1 - l.discountPct / 100))}</b>
       </div>
     </div>`).join('') || '<p class="muted">اختر الأصناف لإضافتها إلى الفاتورة.</p>';
-  document.getElementById('t-gross').textContent = fmt(gross);
-  document.getElementById('t-total').textContent = fmt(total);
+  document.getElementById('t-gross').textContent = fmt(t.gross);
+  document.getElementById('t-tax').textContent = fmt(t.tax);
+  document.getElementById('t-total').textContent = fmt(t.total);
   const paid = Number(document.getElementById('pos-paid').value) || 0;
   document.getElementById('pos-change').textContent =
     document.getElementById('pay-type').value === 'cash' && paid > 0 ?
-    (paid >= total ? 'الباقي للعميل: ' + fmt(paid - total) : 'المدفوع أقل من الإجمالي') : '';
+    (paid >= t.total ? 'الباقي للعميل: ' + fmt(paid - t.total) : 'المدفوع أقل من الإجمالي') : '';
 }
 
 async function submitSale() {
   try {
-    const gross = cart.reduce((s, l) => s + l.qty * l.unitPrice * (1 - l.discountPct / 100), 0);
-    const d = Math.max(0, Math.min(100, Number(document.getElementById('inv-disc').value) || 0));
-    const total = gross * (1 - d / 100);
+    const t = cartTotals();
     const paidVal = document.getElementById('pos-paid').value;
     const r = await api('/api/sales', { method: 'POST', body: {
       items: cart.map((l) => ({ productId: l.productId, qty: l.qty, unitPrice: l.unitPrice, discountPct: l.discountPct })),
-      invoiceDiscountPct: d,
+      invoiceDiscountPct: Number(document.getElementById('inv-disc').value) || 0,
       paymentType: document.getElementById('pay-type').value,
       customerId: document.getElementById('pos-customer').value || null,
-      paid: paidVal === '' ? total : Number(paidVal) } });
+      paid: paidVal === '' ? t.total : Number(paidVal) } });
     cart = [];
     toast('تم إصدار الفاتورة ' + r.number + (r.change > 0 ? ' — الباقي: ' + fmt(r.change) : ''));
     vPOS();
@@ -373,7 +395,7 @@ async function vInventory() {
       <td>${p.stock} ${esc(UNITS[p.unit] || '')}</td><td>${p.reorder_level}</td>
       <td>${fmt(p.avg_cost)}</td><td>${fmt(p.value)}</td>
       <td>${p.low ? '<span class="badge warn">يحتاج طلب</span>' : '<span class="badge ok">جيد</span>'}</td>
-      <td>${canAdj ? '<button class="btn sm ghost" onclick="adjustForm(' + p.id + ', \'' + esc(p.name).replace(/'/g, '') + '\')">تسوية</button>' : ''}
+      <td>${canAdj ? '<button class="btn sm ghost" onclick="adjustForm(' + p.id + ', \'' + jsq(p.name) + '\')">تسوية</button>' : ''}
       </tr>`).join('')}
     </tbody></table>`;
   window.__inv = rows;
@@ -594,7 +616,7 @@ async function vCustomers() {
       <td>${esc(c.name)}</td><td>${esc(c.phone || '—')}</td><td>${fmt(c.credit_limit)}</td>
       <td style="${c.balance > 0 ? 'color:var(--err);font-weight:700' : ''}">${fmt(c.balance)}</td>
       <td>${canWrite ? '<button class="btn sm ghost" onclick="customerForm(' + c.id + ')">تعديل</button>' : ''}
-          ${canPay && c.balance > 0 ? '<button class="btn sm ok" onclick="payForm(\'customer\',' + c.id + ',\'' + esc(c.name).replace(/'/g, '') + '\',' + c.balance + ')">تحصيل</button>' : ''}</td>
+          ${canPay && c.balance > 0 ? '<button class="btn sm ok" onclick="payForm(\'customer\',' + c.id + ',\'' + jsq(c.name) + '\',' + c.balance + ')">تحصيل</button>' : ''}</td>
     </tr>`).join('')}
     </tbody></table>`;
   window.__customers = rows;
@@ -640,7 +662,7 @@ async function vSuppliers() {
       <td>${esc(s.name)}</td><td>${esc(s.phone || '—')}</td>
       <td style="${s.balance > 0 ? 'color:var(--err);font-weight:700' : ''}">${fmt(s.balance)}</td>
       <td><button class="btn sm ghost" onclick="supplierForm(${s.id})">تعديل</button>
-          ${canPay && s.balance > 0 ? '<button class="btn sm ok" onclick="payForm(\'supplier\',' + s.id + ',\'' + esc(s.name).replace(/'/g, '') + '\',' + s.balance + ')">سداد</button>' : ''}</td>
+          ${canPay && s.balance > 0 ? '<button class="btn sm ok" onclick="payForm(\'supplier\',' + s.id + ',\'' + jsq(s.name) + '\',' + s.balance + ')">سداد</button>' : ''}</td>
     </tr>`).join('')}
     </tbody></table>`;
   window.__suppliers = rows;
@@ -945,3 +967,4 @@ setInterval(() => {
     await afterLogin();
   } catch (e) { showLogin(); }
 })();
+

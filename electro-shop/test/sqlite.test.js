@@ -43,7 +43,7 @@ check('الجداول المطلوبة موجودة', function () {
   ['settings','users','audit_log','categories','products','stock_moves','customers',
    'suppliers','sales','sale_items','purchases','purchase_items','sale_returns',
    'sale_return_items','purchase_returns','purchase_return_items','cashbox_tx',
-   'payments','journal','expenses','backups','counters']
+   'payments','journal','expenses','backups','price_history','counters']
   .forEach(function (t) {
     const r = store.db.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE name = ?").get(t);
     ok(r.c === 1, 'الجدول ' + t + ' غير موجود');
@@ -126,3 +126,4 @@ console.log('  ' + '='.repeat(52));
 console.log('  النتيجة: ' + pass + ' نجاح' + (fail > 0 ? ' — ' + fail + ' فشل' : ''));
 console.log('');
 if (fail > 0) process.exit(1);
+

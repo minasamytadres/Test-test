@@ -158,10 +158,18 @@ CREATE TABLE IF NOT EXISTS backups (
   filename TEXT NOT NULL, size_bytes INTEGER NOT NULL,
   created_by TEXT, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS price_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_id INTEGER NOT NULL,
+  old_cost REAL NOT NULL DEFAULT 0, old_sale REAL NOT NULL DEFAULT 0,
+  new_cost REAL NOT NULL DEFAULT 0, new_sale REAL NOT NULL DEFAULT 0,
+  user_id INTEGER, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS counters (
   name TEXT PRIMARY KEY, value INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_moves_product ON stock_moves(product_id);
+CREATE INDEX IF NOT EXISTS idx_price_history_product ON price_history(product_id);
 CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
 CREATE INDEX IF NOT EXISTS idx_purch_items_purch ON purchase_items(purchase_id);
 CREATE INDEX IF NOT EXISTS idx_journal_account ON journal(account);
@@ -312,3 +320,4 @@ function seedSample(store) {
 module.exports = { SCHEMA: SCHEMA, SqliteStore: SqliteStore, hashPassword: hashPassword,
                    verifyPassword: verifyPassword, ensureDefaults: DEFAULT_SETTINGS,
                    seedSample: seedSample, nowISO: nowISO };
+

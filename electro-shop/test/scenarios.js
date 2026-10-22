@@ -122,6 +122,17 @@ function buildScenarios(E) {
       E.validateSale({ items: [{ qty: 1, unitPrice: 100, discountPct: 15, costPrice: 0 }],
         maxDiscountPct: 10, hasDiscountPerm: false, requireDiscountPerm: true });
     }, 'E_DISCOUNT_PERM');
+    throwsCode(function () {
+      E.validateSale({ items: [{ qty: 1, unitPrice: 100, costPrice: 0 }], invoiceDiscountPct: 15,
+        maxDiscountPct: 10, hasDiscountPerm: true, requireDiscountPerm: true });
+    }, 'E_DISCOUNT_CAP');
+    throwsCode(function () {
+      E.validateSale({ items: [{ qty: 1, unitPrice: 100, costPrice: 0 }], invoiceDiscountPct: 5,
+        maxDiscountPct: 10, hasDiscountPerm: false, requireDiscountPerm: true });
+    }, 'E_DISCOUNT_PERM');
+    const t2 = E.validateSale({ items: [{ qty: 1, unitPrice: 100, costPrice: 0 }], invoiceDiscountPct: 10,
+      maxDiscountPct: 10, hasDiscountPerm: true, requireDiscountPerm: true });
+    eq(t2.total, 90, 'خصم الفاتورة يُحسب ضمن الحد');
   }});
 
   /* ------------------------- حالات حدية ------------------------- */
@@ -196,3 +207,4 @@ function buildScenarios(E) {
 }
 
 module.exports = { buildScenarios: buildScenarios };
+
